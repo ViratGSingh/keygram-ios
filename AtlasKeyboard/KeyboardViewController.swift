@@ -2,8 +2,7 @@ import UIKit
 
 final class KeyboardViewController: UIInputViewController {
     private enum LayoutMetric {
-        // Matches KeyboardSurfaceView.LayoutMetric.keyboardContentHeight (1 toolbar + 4 key rows + slack).
-        static let keyboardHeight: CGFloat = 38 + 44 * 4 + 8
+        static let keyboardHeight: CGFloat = KeyboardSurfaceView.preferredKeyboardHeight
     }
 
     private var engine: AtlasInferenceEngine?
@@ -524,9 +523,7 @@ extension KeyboardViewController: KeyboardSurfaceViewDelegate {
         case .shift:
             isCapsLocked.toggle()
             view.setShiftState(isCapsLocked, capsLocked: isCapsLocked)
-        case .globe:
-            advanceToNextInputMode()
-        case .modeToggle, .symbolToggle:
+        case .globe, .modeToggle, .symbolToggle:
             break
         }
     }

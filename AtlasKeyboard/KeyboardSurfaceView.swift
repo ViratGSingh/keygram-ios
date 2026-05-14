@@ -18,29 +18,48 @@ enum KeyboardKey: Equatable {
     case globe
     case modeToggle
     case symbolToggle
+
+    var defaultTitle: String {
+        switch self {
+        case .character(let character):
+            return character
+        case .shift:
+            return "shift"
+        case .backspace:
+            return "delete.left"
+        case .space:
+            return "space"
+        case .returnKey:
+            return "return"
+        case .globe:
+            return "globe"
+        case .modeToggle:
+            return "123"
+        case .symbolToggle:
+            return "#+="
+        }
+    }
 }
 
 final class KeyboardSurfaceView: UIView {
     private enum LayoutMetric {
         // Suggestion bar is slimmer than a key row, matching the iOS system keyboard.
         static let toolbarHeight: CGFloat = 38
-        static let rowHeight: CGFloat = 44
+        static let rowHeight: CGFloat = 52
         // 1 toolbar + 4 key rows + a little vertical slack.
         static let keyboardContentHeight: CGFloat = toolbarHeight + rowHeight * 4 + 8
         static let buttonHorizontalInset: CGFloat = 3
         static let buttonVerticalInset: CGFloat = 4
-        static let lowerSystemButtonWidth: CGFloat = 0.13
-        static let bottomSystemButtonWidth: CGFloat = 0.123
-        static let primaryButtonWidth: CGFloat = 0.25
-        static let middleInputRowWidth: CGFloat = 0.90
-        static let lowerAlphabeticInputRowWidth: CGFloat = 0.70
-        static let lowerNumericInputRowWidth: CGFloat = 0.70
     }
 
     static var keyboardBackgroundColor: UIColor {
         UIColor { trait in
             trait.userInterfaceStyle == .dark ? UIColor(red: 0.08, green: 0.09, blue: 0.1, alpha: 1) : UIColor(red: 227 / 255, green: 229 / 255, blue: 233 / 255, alpha: 1)
         }
+    }
+
+    static var preferredKeyboardHeight: CGFloat {
+        LayoutMetric.keyboardContentHeight
     }
 
     weak var delegate: KeyboardSurfaceViewDelegate?
@@ -104,6 +123,32 @@ final class KeyboardSurfaceView: UIView {
         case engrams
     }
 
+    private struct KeyLayout {
+        var itemRows: [[Item]]
+
+        struct Item {
+            var key: KeyboardKey?
+            var title: String
+            var width: Width
+
+            static func key(_ key: KeyboardKey, title: String? = nil, width: Width) -> Item {
+                Item(key: key, title: title ?? key.defaultTitle, width: width)
+            }
+
+            static func spacer(width: Width = .available) -> Item {
+                Item(key: nil, title: "", width: width)
+            }
+        }
+
+        enum Width {
+            case input
+            case inputPercentage(CGFloat)
+            case percentage(CGFloat)
+            case points(CGFloat)
+            case available
+        }
+    }
+
     override init(frame: CGRect) {
         super.init(frame: frame)
         build()
@@ -121,15 +166,18 @@ final class KeyboardSurfaceView: UIView {
     override func layoutSubviews() {
         super.layoutSubviews()
         let contentHeight = min(LayoutMetric.keyboardContentHeight, bounds.height)
+        let contentWidth = keyboardContentWidth
         let contentFrame = CGRect(
             x: 0,
             y: max(0, bounds.height - contentHeight),
-            width: bounds.width,
+            width: contentWidth,
             height: contentHeight
         )
         backgroundPanel.frame = contentFrame
         rootStack.frame = contentFrame
         updateRowHeights(for: contentHeight)
+        rootStack.setNeedsLayout()
+        rootStack.layoutIfNeeded()
         updateSuggestionSeparators()
 
         // The menu overlay covers the key area beneath the toolbar slot.
@@ -140,6 +188,10 @@ final class KeyboardSurfaceView: UIView {
             width: max(0, contentFrame.width - 24),
             height: max(0, contentFrame.height - toolbarHeight - 16)
         )
+    }
+
+    private var keyboardContentWidth: CGFloat {
+        bounds.width
     }
 
     func prepareForTeardown() {
@@ -237,7 +289,6 @@ final class KeyboardSurfaceView: UIView {
             width: max(bounds.width, 320),
             height: LayoutMetric.keyboardContentHeight
         )
-        rootStack.translatesAutoresizingMaskIntoConstraints = false
         addSubview(rootStack)
 
         buildToolbarSlot(in: rootStack)
@@ -296,9 +347,9 @@ final class KeyboardSurfaceView: UIView {
         }
         suggestionStack.addArrangedSubview(chipsContainer)
 
-        toolbarToggleButton = makeToolbarChevron(expanded: false)
-        toolbarToggleButton.addTarget(self, action: #selector(toolbarToggleTapped), for: .touchUpInside)
-        suggestionStack.addArrangedSubview(toolbarToggleButton)
+        // toolbarToggleButton = makeToolbarChevron(expanded: false)
+        // toolbarToggleButton.addTarget(self, action: #selector(toolbarToggleTapped), for: .touchUpInside)
+        // suggestionStack.addArrangedSubview(toolbarToggleButton)
 
         buildSuggestionSeparators()
     }
@@ -327,9 +378,9 @@ final class KeyboardSurfaceView: UIView {
         dismiss.addTarget(self, action: #selector(dismissKeyboardTapped), for: .touchUpInside)
         collapsedToolbar.addArrangedSubview(dismiss)
 
-        let chevronClose = makeToolbarChevron(expanded: true)
-        chevronClose.addTarget(self, action: #selector(toolbarToggleTapped), for: .touchUpInside)
-        collapsedToolbar.addArrangedSubview(chevronClose)
+        // let chevronClose = makeToolbarChevron(expanded: true)
+        // chevronClose.addTarget(self, action: #selector(toolbarToggleTapped), for: .touchUpInside)
+        // collapsedToolbar.addArrangedSubview(chevronClose)
     }
 
     private func makeToolbarChevron(expanded: Bool) -> UIButton {
@@ -469,29 +520,7 @@ final class KeyboardSurfaceView: UIView {
     }
 
     private func buildLetterRows() {
-        addCharacterRow("qwertyuiop")
-        addCharacterRow("asdfghjkl", inputWidthMultiplier: LayoutMetric.middleInputRowWidth)
-
-        let third = keyboardRow()
-        addKey(.shift, title: "shift", to: third, widthMultiplier: LayoutMetric.lowerSystemButtonWidth)
-        third.addArrangedSubview(FlexibleSpacerView())
-
-        let zxcvKeys = inputCluster(for: "zxcvbnm".map(String.init))
-        third.addArrangedSubview(zxcvKeys)
-        zxcvKeys.widthAnchor.constraint(equalTo: third.widthAnchor, multiplier: LayoutMetric.lowerAlphabeticInputRowWidth).isActive = true
-
-        third.addArrangedSubview(FlexibleSpacerView())
-        let backspace = addKey(.backspace, title: "delete.left", to: third, widthMultiplier: LayoutMetric.lowerSystemButtonWidth)
-        backspace.addGestureRecognizer(UILongPressGestureRecognizer(target: self, action: #selector(backspaceLongPressed(_:))))
-        keyStack.addArrangedSubview(third)
-
-        let bottom = keyboardRow()
-        addKey(.modeToggle, title: "123", to: bottom, widthMultiplier: LayoutMetric.bottomSystemButtonWidth)
-        addKey(.globe, title: "globe", to: bottom, widthMultiplier: LayoutMetric.bottomSystemButtonWidth)
-        let spaceKey = addKey(.space, title: "space", to: bottom)
-        spaceKey.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        addKey(.returnKey, title: "return", to: bottom, widthMultiplier: LayoutMetric.primaryButtonWidth)
-        keyStack.addArrangedSubview(bottom)
+        renderKeyLayout(letterLayout)
     }
 
     private func buildEmojiRows() {
@@ -732,75 +761,155 @@ final class KeyboardSurfaceView: UIView {
     }
 
     private func buildSymbolRows() {
-        addCharacterRow(["[", "]", "{", "}", "#", "%", "^", "*", "+", "="])
-        addCharacterRow(["_", "\\", "|", "~", "<", ">", "\u{20AC}", "\u{00A3}", "\u{00A5}", "\u{2022}"])
-
-        let third = keyboardRow()
-        addKey(.symbolToggle, title: "123", to: third, widthMultiplier: LayoutMetric.lowerSystemButtonWidth)
-        third.addArrangedSubview(FlexibleSpacerView())
-
-        let punctuationKeys = inputCluster(for: [".", ",", "?", "!", "\u{2019}"])
-        third.addArrangedSubview(punctuationKeys)
-        punctuationKeys.widthAnchor.constraint(equalTo: third.widthAnchor, multiplier: LayoutMetric.lowerNumericInputRowWidth).isActive = true
-
-        third.addArrangedSubview(FlexibleSpacerView())
-        let backspace = addKey(.backspace, title: "delete.left", to: third, widthMultiplier: LayoutMetric.lowerSystemButtonWidth)
-        backspace.addGestureRecognizer(UILongPressGestureRecognizer(target: self, action: #selector(backspaceLongPressed(_:))))
-        keyStack.addArrangedSubview(third)
-
-        let bottom = keyboardRow()
-        addKey(.modeToggle, title: "ABC", to: bottom, widthMultiplier: LayoutMetric.bottomSystemButtonWidth)
-        addKey(.globe, title: "globe", to: bottom, widthMultiplier: LayoutMetric.bottomSystemButtonWidth)
-        let spaceKey = addKey(.space, title: "space", to: bottom)
-        spaceKey.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        addKey(.returnKey, title: "return", to: bottom, widthMultiplier: LayoutMetric.primaryButtonWidth)
-        keyStack.addArrangedSubview(bottom)
+        renderKeyLayout(symbolLayout)
     }
 
     private func buildNumberRows() {
-        addCharacterRow("1234567890")
-        addCharacterRow(["-", "/", ":", ";", "(", ")", "$", "&", "@", "\u{201D}"])
-
-        let third = keyboardRow()
-        addKey(.symbolToggle, title: "#+=", to: third, widthMultiplier: LayoutMetric.lowerSystemButtonWidth)
-        third.addArrangedSubview(FlexibleSpacerView())
-
-        let punctuationKeys = inputCluster(for: [".", ",", "?", "!", "\u{2019}"])
-        third.addArrangedSubview(punctuationKeys)
-        punctuationKeys.widthAnchor.constraint(equalTo: third.widthAnchor, multiplier: LayoutMetric.lowerNumericInputRowWidth).isActive = true
-
-        third.addArrangedSubview(FlexibleSpacerView())
-        let backspace = addKey(.backspace, title: "delete.left", to: third, widthMultiplier: LayoutMetric.lowerSystemButtonWidth)
-        backspace.addGestureRecognizer(UILongPressGestureRecognizer(target: self, action: #selector(backspaceLongPressed(_:))))
-        keyStack.addArrangedSubview(third)
-
-        let bottom = keyboardRow()
-        addKey(.modeToggle, title: "ABC", to: bottom, widthMultiplier: LayoutMetric.bottomSystemButtonWidth)
-        addKey(.globe, title: "globe", to: bottom, widthMultiplier: LayoutMetric.bottomSystemButtonWidth)
-        let spaceKey = addKey(.space, title: "space", to: bottom)
-        spaceKey.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        addKey(.returnKey, title: "return", to: bottom, widthMultiplier: LayoutMetric.primaryButtonWidth)
-        keyStack.addArrangedSubview(bottom)
+        renderKeyLayout(numberLayout)
     }
 
-    private func addCharacterRow(_ characters: String, inputWidthMultiplier: CGFloat? = nil) {
-        addCharacterRow(characters.map(String.init), inputWidthMultiplier: inputWidthMultiplier)
+    private var letterLayout: KeyLayout {
+        KeyLayout(itemRows: [
+            inputRow("qwertyuiop"),
+            [.spacer(width: .inputPercentage(0.5))] + inputItems("asdfghjkl") + [.spacer(width: .inputPercentage(0.5))],
+            [
+                .key(.shift, width: .inputPercentage(1.3)),
+                .spacer(),
+            ] + inputItems("zxcvbnm") + [
+                .spacer(),
+                .key(.backspace, width: .inputPercentage(1.3)),
+            ],
+            [
+                .key(.modeToggle, title: "123", width: .inputPercentage(1.23)),
+                .key(.globe, width: .inputPercentage(1.23)),
+                .key(.space, width: .available),
+                .key(.returnKey, width: .percentage(0.25)),
+            ],
+        ])
     }
 
-    private func addCharacterRow(_ characters: [String], inputWidthMultiplier: CGFloat? = nil) {
-        let row = keyboardRow()
-        let keys = inputCluster(for: characters)
+    private var numberLayout: KeyLayout {
+        KeyLayout(itemRows: [
+            inputRow("1234567890"),
+            inputRow(["-", "/", ":", ";", "(", ")", "$", "&", "@", "\u{201D}"]),
+            [
+                .key(.symbolToggle, title: "#+=", width: .inputPercentage(1.3)),
+                .spacer(),
+            ] + inputItems([".", ",", "?", "!", "\u{2019}"]) + [
+                .spacer(),
+                .key(.backspace, width: .inputPercentage(1.3)),
+            ],
+            [
+                .key(.modeToggle, title: "ABC", width: .inputPercentage(1.23)),
+                .key(.globe, width: .inputPercentage(1.23)),
+                .key(.space, width: .available),
+                .key(.returnKey, width: .percentage(0.25)),
+            ],
+        ])
+    }
 
-        if let inputWidthMultiplier {
-            row.addArrangedSubview(FlexibleSpacerView())
-            row.addArrangedSubview(keys)
-            keys.widthAnchor.constraint(equalTo: row.widthAnchor, multiplier: inputWidthMultiplier).isActive = true
-            row.addArrangedSubview(FlexibleSpacerView())
-        } else {
-            row.addArrangedSubview(keys)
+    private var symbolLayout: KeyLayout {
+        KeyLayout(itemRows: [
+            inputRow(["[", "]", "{", "}", "#", "%", "^", "*", "+", "="]),
+            inputRow(["_", "\\", "|", "~", "<", ">", "\u{20AC}", "\u{00A3}", "\u{00A5}", "\u{2022}"]),
+            [
+                .key(.symbolToggle, title: "123", width: .inputPercentage(1.3)),
+                .spacer(),
+            ] + inputItems([".", ",", "?", "!", "\u{2019}"]) + [
+                .spacer(),
+                .key(.backspace, width: .inputPercentage(1.3)),
+            ],
+            [
+                .key(.modeToggle, title: "ABC", width: .inputPercentage(1.23)),
+                .key(.globe, width: .inputPercentage(1.23)),
+                .key(.space, width: .available),
+                .key(.returnKey, width: .percentage(0.25)),
+            ],
+        ])
+    }
+
+    private func inputRow(_ characters: String) -> [KeyLayout.Item] {
+        inputItems(characters.map(String.init))
+    }
+
+    private func inputRow(_ characters: [String]) -> [KeyLayout.Item] {
+        inputItems(characters)
+    }
+
+    private func inputItems(_ characters: String) -> [KeyLayout.Item] {
+        inputItems(characters.map(String.init))
+    }
+
+    private func inputItems(_ characters: [String]) -> [KeyLayout.Item] {
+        characters.map { .key(.character($0), title: $0, width: .input) }
+    }
+
+    private func renderKeyLayout(_ layout: KeyLayout) {
+        for itemRow in layout.itemRows {
+            let row = keyboardRow()
+            let widthMultipliers = resolvedWidthMultipliers(for: itemRow)
+            for (item, widthMultiplier) in zip(itemRow, widthMultipliers) {
+                addLayoutItem(item, to: row, widthMultiplier: widthMultiplier)
+            }
+            keyStack.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: keyStack.widthAnchor).isActive = true
+        }
+    }
+
+    private func resolvedWidthMultipliers(for itemRow: [KeyLayout.Item]) -> [CGFloat?] {
+        let hasAvailableWidth = itemRow.contains {
+            if case .available = $0.width { return true }
+            return false
         }
 
-        keyStack.addArrangedSubview(row)
+        if hasAvailableWidth {
+            let fixedWidth = itemRow.reduce(CGFloat(0)) { result, item in
+                result + (fixedWidthMultiplier(for: item.width) ?? 0)
+            }
+            let availableCount = itemRow.filter {
+                if case .available = $0.width { return true }
+                return false
+            }.count
+            let availableWidth = availableCount > 0 ? max(0, 1 - fixedWidth) / CGFloat(availableCount) : 0
+
+            return itemRow.map { item in
+                if case .available = item.width { return availableWidth }
+                return fixedWidthMultiplier(for: item.width)
+            }
+        }
+
+        let weights = itemRow.map { proportionalWeight(for: $0.width) }
+        let totalWeight = weights.reduce(CGFloat(0), +)
+        guard totalWeight > 0 else { return itemRow.map { _ in nil } }
+        return weights.map { $0 / totalWeight }
+    }
+
+    private func fixedWidthMultiplier(for width: KeyLayout.Width) -> CGFloat? {
+        switch width {
+        case .input:
+            return inputKeyWidthMultiplier
+        case .inputPercentage(let multiplier):
+            return inputKeyWidthMultiplier * multiplier
+        case .percentage(let multiplier):
+            return multiplier
+        case .available, .points:
+            return nil
+        }
+    }
+
+    private func proportionalWeight(for width: KeyLayout.Width) -> CGFloat {
+        switch width {
+        case .input:
+            return 1
+        case .inputPercentage(let multiplier):
+            return multiplier
+        case .percentage(let multiplier):
+            return multiplier
+        case .available:
+            return 1
+        case .points:
+            return 0
+        }
     }
 
     private func keyboardRow() -> UIStackView {
@@ -826,35 +935,37 @@ final class KeyboardSurfaceView: UIView {
         keyRowHeightConstraints.forEach { $0.constant = rowHeight }
     }
 
-    private func inputCluster(for characters: [String]) -> UIStackView {
-        let keys = UIStackView()
-        keys.axis = .horizontal
-        keys.spacing = 0
-        keys.distribution = .fillEqually
-        keys.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        for character in characters {
-            let key = makeKey(.character(character), title: character, width: nil)
-            keys.addArrangedSubview(keyContainer(for: key))
-        }
-        return keys
-    }
-
     @discardableResult
-    private func addKey(_ key: KeyboardKey, title: String, to row: UIStackView, widthMultiplier: CGFloat? = nil) -> KeyboardButton {
-        let button = makeKey(key, title: title, width: nil)
-        let container = keyContainer(for: button)
-        row.addArrangedSubview(container)
-        if let widthMultiplier {
-            container.widthAnchor.constraint(equalTo: row.widthAnchor, multiplier: widthMultiplier).isActive = true
-            container.setContentHuggingPriority(.required, for: .horizontal)
-            container.setContentCompressionResistancePriority(.required, for: .horizontal)
+    private func addLayoutItem(_ item: KeyLayout.Item, to row: UIStackView, widthMultiplier: CGFloat?) -> KeyboardButton? {
+        let view: UIView
+        let button: KeyboardButton?
+
+        if let key = item.key {
+            let keyButton = makeKey(key, title: item.title, width: nil)
+            if key == .backspace {
+                keyButton.addGestureRecognizer(UILongPressGestureRecognizer(target: self, action: #selector(backspaceLongPressed(_:))))
+            }
+            view = keyContainer(for: keyButton)
+            button = keyButton
+        } else {
+            view = FlexibleSpacerView()
+            button = nil
         }
+
+        row.addArrangedSubview(view)
+        apply(item.width, to: view, in: row, widthMultiplier: widthMultiplier)
         return button
     }
 
     private func keyContainer(for button: KeyboardButton) -> UIView {
         let container = UIView()
         button.translatesAutoresizingMaskIntoConstraints = false
+        button.hitTestOutsets = UIEdgeInsets(
+            top: LayoutMetric.buttonVerticalInset,
+            left: LayoutMetric.buttonHorizontalInset,
+            bottom: LayoutMetric.buttonVerticalInset,
+            right: LayoutMetric.buttonHorizontalInset
+        )
         container.addSubview(button)
         NSLayoutConstraint.activate([
             button.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: LayoutMetric.buttonHorizontalInset),
@@ -865,12 +976,30 @@ final class KeyboardSurfaceView: UIView {
         return container
     }
 
-    private func rowStack() -> UIStackView {
-        let row = UIStackView()
-        row.axis = .horizontal
-        row.spacing = 5
-        row.distribution = .fillEqually
-        return row
+    private func apply(_ width: KeyLayout.Width, to view: UIView, in row: UIStackView, widthMultiplier: CGFloat?) {
+        if let widthMultiplier {
+            view.widthAnchor.constraint(equalTo: row.widthAnchor, multiplier: widthMultiplier).isActive = true
+            lockHorizontalSize(of: view)
+            return
+        }
+
+        switch width {
+        case .points(let points):
+            view.widthAnchor.constraint(equalToConstant: points).isActive = true
+            lockHorizontalSize(of: view)
+        case .available, .input, .inputPercentage, .percentage:
+            view.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        }
+    }
+
+    private var inputKeyWidthMultiplier: CGFloat {
+        0.1
+    }
+
+    private func lockHorizontalSize(of view: UIView) {
+        view.setContentHuggingPriority(.required, for: .horizontal)
+        view.setContentCompressionResistancePriority(.required, for: .horizontal)
     }
 
     private func makeSuggestionButton(title: String) -> UIButton {
@@ -1131,7 +1260,7 @@ final class KeyboardSurfaceView: UIView {
         case .backspace:
             return "delete.left"
         case .globe:
-            return "globe"
+            return "face.smiling"
         case .returnKey:
             return returnKeyIconName(for: returnKeyType)
         default:
@@ -1177,6 +1306,13 @@ final class KeyboardSurfaceView: UIView {
     }
 
     @objc private func keyTapped(_ sender: KeyboardButton) {
+        if sender.key == .globe {
+            triggerKeyFeedback()
+            emojiPanelMode = .emojis
+            keyboardMode = .emoji
+            UIView.performWithoutAnimation { rebuildKeyboardRows() }
+            return
+        }
         if sender.key == .modeToggle {
             triggerKeyFeedback()
             keyboardMode = keyboardMode == .letters ? .numbers : .letters
@@ -1229,6 +1365,7 @@ final class KeyboardSurfaceView: UIView {
 
         let container = UIView(frame: CGRect(x: previewX, y: previewY, width: previewWidth, height: previewHeight))
         container.backgroundColor = .clear
+        container.isUserInteractionEnabled = false
         container.layer.shadowColor = UIColor.black.cgColor
         container.layer.shadowOpacity = 0.18
         container.layer.shadowRadius = 5
@@ -1379,6 +1516,7 @@ final class KeyboardSurfaceView: UIView {
 
 final class KeyboardButton: UIButton {
     let key: KeyboardKey
+    var hitTestOutsets: UIEdgeInsets = .zero
 
     init(key: KeyboardKey) {
         self.key = key
@@ -1393,6 +1531,16 @@ final class KeyboardButton: UIButton {
         didSet {
             alpha = isHighlighted ? 0.72 : 1
         }
+    }
+
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+        let hitBounds = bounds.inset(by: UIEdgeInsets(
+            top: -hitTestOutsets.top,
+            left: -hitTestOutsets.left,
+            bottom: -hitTestOutsets.bottom,
+            right: -hitTestOutsets.right
+        ))
+        return hitBounds.contains(point)
     }
 }
 
