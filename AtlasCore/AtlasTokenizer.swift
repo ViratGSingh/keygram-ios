@@ -44,16 +44,48 @@ final class AtlasTokenizer: AtlasTokenizing {
 
 final class AtlasVocabularyIndex {
     private let words: [String]
+    private let fallbackScoresByWord: [String: Double]
+    let diagnosticsDescription: String
 
-    init(extraWords: [String] = []) {
-        let seedWords = [
-        "about", "after", "amazing", "atlas", "because", "before", "definitely",
-        "check", "dinner", "draft", "forward", "great", "keyboard", "meeting", "personal", "probably",
-        "qbr", "report", "reservation", "sarita", "session", "thanks", "today",
-        "tomorrow", "tonight", "travel", "work", "you"
-        ]
-        let merged = Set(seedWords + extraWords.map { $0.lowercased() })
-        words = merged.sorted()
+    init(bundle: Bundle = .main, extraWords: [String] = []) {
+        let frequencyTable = AtlasAutocorrectDataLoader.loadFrequencyTable(named: "frequency_table", bundle: bundle)
+        let frequencyTableIsValid = frequencyTable.map(AtlasAutocorrectDataLoader.isPlausibleFrequencyTable) ?? false
+        let importedWords = AtlasAutocorrectDataLoader.loadWordList(named: "english_words", bundle: bundle) ?? []
+        let importedWordSet = Set(importedWords)
+        let rankedDictionaryWords: [String]
+        let frequencyStatus: String
+
+        if let frequencyTable, frequencyTableIsValid {
+            rankedDictionaryWords = AtlasAutocorrectDataLoader
+                .topFrequencyWords(from: frequencyTable, limit: frequencyTable.count)
+                .filter { importedWordSet.contains($0) }
+                .prefix(AtlasConfiguration.suggestionVocabularyLimit)
+                .map(\.self)
+            let topWords = Array(rankedDictionaryWords.prefix(5)).joined(separator: ",")
+            frequencyStatus = "loaded entries=\(frequencyTable.count) top=\(topWords)"
+        } else if let frequencyTable {
+            rankedDictionaryWords = Array(importedWords.prefix(AtlasConfiguration.suggestionVocabularyLimit))
+            frequencyStatus = "rejected entries=\(frequencyTable.count); fallback=english_words order"
+        } else {
+            rankedDictionaryWords = Array(importedWords.prefix(AtlasConfiguration.suggestionVocabularyLimit))
+            frequencyStatus = "missing; fallback=english_words order"
+        }
+
+        let overlayWords = EngramNormalizer.commonWordsForAutocorrect.map { $0.lowercased() }
+            + extraWords.map { $0.lowercased() }
+        let merged = Self.orderedUnique(rankedDictionaryWords + overlayWords)
+        let mergedWords = merged
+        words = mergedWords
+
+        let maxFrequency = frequencyTable?.values.max() ?? Double(max(mergedWords.count, 1))
+        fallbackScoresByWord = Dictionary(
+            uniqueKeysWithValues: mergedWords.enumerated().map { index, word in
+                let rawScore = frequencyTable?[word] ?? Double(max(mergedWords.count - index, 1))
+                let score = max(0.05, min(1.0, rawScore / maxFrequency))
+                return (word, score)
+            }
+        )
+        diagnosticsDescription = "source=frequency-ranked english_words.bin limit=\(AtlasConfiguration.suggestionVocabularyLimit) words=\(mergedWords.count); frequency_table.bin \(frequencyStatus); tokenizerOverlay=\(extraWords.count)"
     }
 
     func completions(for prefix: String) -> [String] {
@@ -79,6 +111,24 @@ final class AtlasVocabularyIndex {
 
     func allWords() -> [String] {
         words
+    }
+
+    func fallbackScores(limit: Int) -> [String: Double] {
+        Dictionary(
+            uniqueKeysWithValues: words.prefix(limit).compactMap { word in
+                fallbackScoresByWord[word].map { (word, $0) }
+            }
+        )
+    }
+
+    private static func orderedUnique(_ words: [String]) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        result.reserveCapacity(words.count)
+        for word in words where seen.insert(word).inserted {
+            result.append(word)
+        }
+        return result
     }
 }
 

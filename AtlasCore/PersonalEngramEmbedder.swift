@@ -8,6 +8,7 @@ final class PersonalEngramEmbedder {
     private var embedding: NLContextualEmbedding?
     private var isLoaded = false
     private var assetsRequested = false
+    private var isUnavailable = Bundle.main.bundleURL.pathExtension == "appex"
     private var cache: [String: [Float]] = [:]
 
     private init() {}
@@ -17,6 +18,10 @@ final class PersonalEngramEmbedder {
         guard !key.isEmpty else { return nil }
 
         lock.lock()
+        if isUnavailable {
+            lock.unlock()
+            return nil
+        }
         if let cached = cache[key] {
             lock.unlock()
             return cached
@@ -54,6 +59,10 @@ final class PersonalEngramEmbedder {
 
     private func loadedEmbedding() -> NLContextualEmbedding? {
         lock.lock()
+        if isUnavailable {
+            lock.unlock()
+            return nil
+        }
         if isLoaded, let embedding {
             lock.unlock()
             return embedding
@@ -61,10 +70,13 @@ final class PersonalEngramEmbedder {
         let existing = embedding
         lock.unlock()
 
-        guard let resolved = existing ?? NLContextualEmbedding(language: .english) else { return nil }
+        guard let resolved = existing ?? NLContextualEmbedding(language: .english) else {
+            markUnavailable()
+            return nil
+        }
 
         guard resolved.hasAvailableAssets else {
-            requestAssetsIfNeeded(for: resolved)
+            markUnavailable()
             return nil
         }
 
@@ -76,20 +88,17 @@ final class PersonalEngramEmbedder {
             lock.unlock()
             return resolved
         } catch {
+            markUnavailable()
             return nil
         }
     }
 
-    private func requestAssetsIfNeeded(for embedding: NLContextualEmbedding) {
+    private func markUnavailable() {
         lock.lock()
-        guard !assetsRequested else {
-            lock.unlock()
-            return
-        }
-        assetsRequested = true
+        isUnavailable = true
+        embedding = nil
+        isLoaded = false
         lock.unlock()
-
-        embedding.requestAssets { _, _ in }
     }
 
     private func averageVector(from result: NLContextualEmbeddingResult) -> [Float]? {

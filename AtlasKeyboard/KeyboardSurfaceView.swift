@@ -1,8 +1,8 @@
 import UIKit
 
 protocol KeyboardSurfaceViewDelegate: AnyObject {
-    func keyboardSurfaceView(_ view: KeyboardSurfaceView, didTap key: KeyboardKey)
-    func keyboardSurfaceView(_ view: KeyboardSurfaceView, didAccept suggestion: AtlasSuggestion)
+    func keyboardSurfaceView(_ view: KeyboardSurfaceView, didTap key: KeyboardKey, at point: CGPoint, touchStartedAt: CFTimeInterval, touchEndedAt: CFTimeInterval)
+    func keyboardSurfaceView(_ view: KeyboardSurfaceView, didAccept suggestion: AtlasSuggestion, touchStartedAt: CFTimeInterval, touchEndedAt: CFTimeInterval)
     func keyboardSurfaceViewDidLongPressBackspace(_ view: KeyboardSurfaceView)
     func keyboardSurfaceViewDidLongPressSession(_ view: KeyboardSurfaceView)
     func keyboardSurfaceViewDidRequestDismissKeyboard(_ view: KeyboardSurfaceView)
@@ -88,6 +88,7 @@ final class KeyboardSurfaceView: UIView {
     private var hapticsToggleButton: UIButton?
     private var keyPreviewView: UIView?
     private var suggestionSeparatorLayers: [CALayer] = []
+    private var touchStartTimes: [ObjectIdentifier: CFTimeInterval] = [:]
     private var isPersonaPickerOpen = false
     private var isMenuToggled = false
     private var personas: [AtlasSession] = []
@@ -99,17 +100,7 @@ final class KeyboardSurfaceView: UIView {
     private var returnKeyType: UIReturnKeyType = .default
     private var emojiPanelMode: EmojiPanelMode = .emojis
     private let keyFeedback = UIImpactFeedbackGenerator(style: .light)
-    private var hapticsEnabled: Bool {
-        get {
-            let defaults = UserDefaults(suiteName: AtlasConfiguration.appGroupIdentifier) ?? .standard
-            guard defaults.object(forKey: AtlasConfiguration.hapticsEnabledKey) != nil else { return true }
-            return defaults.bool(forKey: AtlasConfiguration.hapticsEnabledKey)
-        }
-        set {
-            let defaults = UserDefaults(suiteName: AtlasConfiguration.appGroupIdentifier) ?? .standard
-            defaults.set(newValue, forKey: AtlasConfiguration.hapticsEnabledKey)
-        }
-    }
+    private var hapticsEnabled = true
 
     private enum KeyboardMode {
         case letters
@@ -267,6 +258,7 @@ final class KeyboardSurfaceView: UIView {
     }
 
     private func build() {
+        hapticsEnabled = Self.persistedHapticsEnabled()
         backgroundColor = .clear
         isOpaque = false
 
@@ -341,7 +333,9 @@ final class KeyboardSurfaceView: UIView {
         for index in 0..<AtlasConfiguration.maxSuggestions {
             let button = makeSuggestionButton(title: "")
             button.tag = index
+            button.addTarget(self, action: #selector(controlTouchDown(_:)), for: .touchDown)
             button.addTarget(self, action: #selector(suggestionTapped(_:)), for: .touchUpInside)
+            button.addTarget(self, action: #selector(controlTouchCancelled(_:)), for: [.touchUpOutside, .touchCancel, .touchDragExit])
             suggestionButtons.append(button)
             chipsContainer.addArrangedSubview(button)
         }
@@ -1187,9 +1181,10 @@ final class KeyboardSurfaceView: UIView {
         button.layer.cornerCurve = .continuous
         button.backgroundColor = keyBackground(for: key)
         button.setTitleColor(.label, for: .normal)
+        button.addTarget(self, action: #selector(keyTouchDown(_:)), for: .touchDown)
         button.addTarget(self, action: #selector(keyTapped(_:)), for: .touchUpInside)
+        button.addTarget(self, action: #selector(keyTouchCancelled(_:)), for: [.touchUpOutside, .touchCancel, .touchDragExit])
         if case .character = key {
-            button.addTarget(self, action: #selector(characterKeyTouchDown(_:)), for: .touchDown)
             button.addTarget(self, action: #selector(characterKeyTouchEnded(_:)), for: [.touchUpInside, .touchUpOutside, .touchCancel, .touchDragExit])
         }
         if let width {
@@ -1206,7 +1201,10 @@ final class KeyboardSurfaceView: UIView {
         button.contentHorizontalAlignment = .leading
         button.backgroundColor = .clear
         button.layer.cornerRadius = 8
+        button.addTarget(self, action: #selector(keyTouchDown(_:)), for: .touchDown)
         button.addTarget(self, action: #selector(keyTapped(_:)), for: .touchUpInside)
+        button.addTarget(self, action: #selector(keyTouchCancelled(_:)), for: [.touchUpOutside, .touchCancel, .touchDragExit])
+        button.addTarget(self, action: #selector(characterKeyTouchEnded(_:)), for: [.touchUpInside, .touchUpOutside, .touchCancel, .touchDragExit])
         keyButtons.append(button)
         return button
     }
@@ -1305,28 +1303,75 @@ final class KeyboardSurfaceView: UIView {
         }
     }
 
+    @objc private func controlTouchDown(_ sender: UIControl) {
+        touchStartTimes[ObjectIdentifier(sender)] = CACurrentMediaTime()
+    }
+
+    @objc private func controlTouchCancelled(_ sender: UIControl) {
+        touchStartTimes.removeValue(forKey: ObjectIdentifier(sender))
+    }
+
+    private func consumeTouchTiming(for control: UIControl) -> (startedAt: CFTimeInterval, endedAt: CFTimeInterval) {
+        let endedAt = CACurrentMediaTime()
+        let identifier = ObjectIdentifier(control)
+        let startedAt = touchStartTimes[identifier] ?? endedAt
+        touchStartTimes.removeValue(forKey: identifier)
+        return (startedAt, endedAt)
+    }
+
+    @objc private func keyTouchDown(_ sender: KeyboardButton) {
+        controlTouchDown(sender)
+        triggerKeyFeedback()
+
+        guard case .character = sender.key,
+              let title = sender.title(for: .normal),
+              !title.isEmpty
+        else { return }
+
+        prepareKeyFeedback()
+        showKeyPreview(title, from: sender)
+    }
+
+    @objc private func keyTouchCancelled(_ sender: KeyboardButton) {
+        controlTouchCancelled(sender)
+    }
+
     @objc private func keyTapped(_ sender: KeyboardButton) {
+        let touchTiming = consumeTouchTiming(for: sender)
         if sender.key == .globe {
-            triggerKeyFeedback()
             emojiPanelMode = .emojis
             keyboardMode = .emoji
             UIView.performWithoutAnimation { rebuildKeyboardRows() }
             return
         }
         if sender.key == .modeToggle {
-            triggerKeyFeedback()
             keyboardMode = keyboardMode == .letters ? .numbers : .letters
             UIView.performWithoutAnimation { rebuildKeyboardRows() }
             return
         }
         if sender.key == .symbolToggle {
-            triggerKeyFeedback()
             keyboardMode = keyboardMode == .symbols ? .numbers : .symbols
             UIView.performWithoutAnimation { rebuildKeyboardRows() }
             return
         }
-        delegate?.keyboardSurfaceView(self, didTap: sender.key)
-        triggerKeyFeedback()
+        let tapPoint = sender.latestTouchLocation(in: self)
+            ?? sender.convert(CGPoint(x: sender.bounds.midX, y: sender.bounds.midY), to: self)
+
+        #if DEBUG
+        let keyCenter = sender.convert(CGPoint(x: sender.bounds.midX, y: sender.bounds.midY), to: self)
+        NSLog(
+            "[Keygram Touch] key=%@ point=(%.1f, %.1f) keyCenter=(%.1f, %.1f) delta=(%.1f, %.1f)",
+            String(describing: sender.key),
+            tapPoint.x,
+            tapPoint.y,
+            keyCenter.x,
+            keyCenter.y,
+            tapPoint.x - keyCenter.x,
+            tapPoint.y - keyCenter.y
+        )
+        #endif
+
+        delegate?.keyboardSurfaceView(self, didTap: sender.key, at: tapPoint, touchStartedAt: touchTiming.startedAt, touchEndedAt: touchTiming.endedAt)
     }
 
     private func triggerKeyFeedback() {
@@ -1338,16 +1383,6 @@ final class KeyboardSurfaceView: UIView {
     private func prepareKeyFeedback() {
         guard hapticsEnabled else { return }
         keyFeedback.prepare()
-    }
-
-    @objc private func characterKeyTouchDown(_ sender: KeyboardButton) {
-        guard case .character = sender.key,
-              let title = sender.title(for: .normal),
-              !title.isEmpty
-        else { return }
-
-        prepareKeyFeedback()
-        showKeyPreview(title, from: sender)
     }
 
     @objc private func characterKeyTouchEnded(_ sender: KeyboardButton) {
@@ -1421,9 +1456,15 @@ final class KeyboardSurfaceView: UIView {
     }
 
     @objc private func suggestionTapped(_ sender: UIButton) {
+        let touchTiming = consumeTouchTiming(for: sender)
         guard let text = sender.title(for: .normal), !text.isEmpty else { return }
         let kind = AtlasSuggestionKind(rawValue: sender.accessibilityIdentifier ?? "") ?? .nextWord
-        delegate?.keyboardSurfaceView(self, didAccept: AtlasSuggestion(text: text, kind: kind, score: 0))
+        delegate?.keyboardSurfaceView(
+            self,
+            didAccept: AtlasSuggestion(text: text, kind: kind, score: 0),
+            touchStartedAt: touchTiming.startedAt,
+            touchEndedAt: touchTiming.endedAt
+        )
     }
 
     @objc private func sessionTapped() {
@@ -1460,6 +1501,7 @@ final class KeyboardSurfaceView: UIView {
     @objc private func menuHapticsTapped() {
         let next = !hapticsEnabled
         hapticsEnabled = next
+        Self.setPersistedHapticsEnabled(next)
         delegate?.keyboardSurfaceView(self, didSetHapticsEnabled: next)
         if let button = hapticsToggleButton {
             var config = button.configuration
@@ -1468,6 +1510,17 @@ final class KeyboardSurfaceView: UIView {
             config?.attributedTitle = AttributedString(hapticsTitle(), attributes: attrs)
             button.configuration = config
         }
+    }
+
+    private static func persistedHapticsEnabled() -> Bool {
+        let defaults = UserDefaults(suiteName: AtlasConfiguration.appGroupIdentifier) ?? .standard
+        guard defaults.object(forKey: AtlasConfiguration.hapticsEnabledKey) != nil else { return true }
+        return defaults.bool(forKey: AtlasConfiguration.hapticsEnabledKey)
+    }
+
+    private static func setPersistedHapticsEnabled(_ enabled: Bool) {
+        let defaults = UserDefaults(suiteName: AtlasConfiguration.appGroupIdentifier) ?? .standard
+        defaults.set(enabled, forKey: AtlasConfiguration.hapticsEnabledKey)
     }
 
     private func setMenuToggled(_ toggled: Bool, animated: Bool) {
@@ -1514,9 +1567,47 @@ final class KeyboardSurfaceView: UIView {
     }
 }
 
+extension KeyboardSurfaceView {
+    func touchModelLayoutSnapshot() -> [AtlasKeyboard.KeyLayout] {
+        layoutIfNeeded()
+
+        return keyButtons.compactMap { button in
+            guard let keyID = touchModelKeyID(for: button.key) else { return nil }
+            let frame = button.convert(button.bounds, to: self)
+            guard frame.width > 0, frame.height > 0 else { return nil }
+
+            return AtlasKeyboard.KeyLayout(
+                id: keyID,
+                centerX: Double(frame.midX),
+                centerY: Double(frame.midY),
+                width: Double(frame.width),
+                height: Double(frame.height)
+            )
+        }
+    }
+
+    private func touchModelKeyID(for key: KeyboardKey) -> String? {
+        switch key {
+        case .character(let value):
+            let normalized = value.lowercased()
+            guard normalized.count == 1,
+                  normalized.rangeOfCharacter(from: .letters) != nil
+            else {
+                return nil
+            }
+            return normalized
+        case .space:
+            return " "
+        case .shift, .backspace, .returnKey, .globe, .modeToggle, .symbolToggle:
+            return nil
+        }
+    }
+}
+
 final class KeyboardButton: UIButton {
     let key: KeyboardKey
     var hitTestOutsets: UIEdgeInsets = .zero
+    private var latestTouchLocationInButton: CGPoint?
 
     init(key: KeyboardKey) {
         self.key = key
@@ -1541,6 +1632,36 @@ final class KeyboardButton: UIButton {
             right: -hitTestOutsets.right
         ))
         return hitBounds.contains(point)
+    }
+
+    func latestTouchLocation(in view: UIView) -> CGPoint? {
+        guard let latestTouchLocationInButton else { return nil }
+        return convert(latestTouchLocationInButton, to: view)
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        updateLatestTouchLocation(from: touches)
+        super.touchesBegan(touches, with: event)
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        updateLatestTouchLocation(from: touches)
+        super.touchesMoved(touches, with: event)
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        updateLatestTouchLocation(from: touches)
+        super.touchesEnded(touches, with: event)
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        updateLatestTouchLocation(from: touches)
+        super.touchesCancelled(touches, with: event)
+    }
+
+    private func updateLatestTouchLocation(from touches: Set<UITouch>) {
+        guard let touch = touches.first else { return }
+        latestTouchLocationInButton = touch.location(in: self)
     }
 }
 

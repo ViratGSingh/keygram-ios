@@ -45,6 +45,7 @@ enum AtlasSuggestionKind: String {
     case completion
     case correction
     case personal
+    case undoAutocorrection
 }
 
 final class AtlasInferenceEngine {
@@ -61,11 +62,18 @@ final class AtlasInferenceEngine {
         modelBundle = try? AtlasModelBundle.resolve(in: bundle)
         self.runtime = runtime
         self.tokenizer = tokenizer
-        vocabulary = AtlasVocabularyIndex(extraWords: tokenizer.vocabularyWords())
+        vocabulary = AtlasVocabularyIndex(bundle: bundle, extraWords: tokenizer.vocabularyWords())
     }
 
     var isModelBundleAvailable: Bool {
         modelBundle != nil
+    }
+
+    var diagnosticsDescription: String {
+        let runtimeStatus = runtime == nil ? "nil" : "loaded"
+        let modelStatus = modelBundle == nil ? "missing" : "available"
+        let suggestionPath = runtime == nil ? "frequency-fallback" : "onnx"
+        return "ONNX runtime=\(runtimeStatus); modelBundle=\(modelStatus); suggestionPath=\(suggestionPath); vocabulary={\(vocabulary.diagnosticsDescription)}"
     }
 
     func restore(glaState: AtlasGLAState) {
@@ -202,9 +210,20 @@ final class AtlasInferenceEngine {
         globalEngram: Engram
     ) -> [String: Double] {
         let runtimeLogits = logits.map { applyEngramBias(to: $0, context: context, session: session, globalEngram: globalEngram) }
-        return runtimeLogits.map { tokenizer.candidateScores(from: $0, limit: limit) }
-            .flatMap { $0.isEmpty ? nil : $0 }
-            ?? simulatedLogits(context: context)
+        if let scores = runtimeLogits.map({ tokenizer.candidateScores(from: $0, limit: limit) }),
+           !scores.isEmpty {
+            return scores
+        }
+
+        let fallbackScores = vocabulary.fallbackScores(limit: limit)
+        if !fallbackScores.isEmpty {
+            return fallbackScores
+        }
+
+        #if DEBUG
+        logInference("no model logits and no frequency fallback; suggestions disabled")
+        #endif
+        return [:]
     }
 
     private func step(tokenID: Int64) {
@@ -237,32 +256,15 @@ final class AtlasInferenceEngine {
         state.positionID += 1
     }
 
-    private func simulatedLogits(context: String) -> [String: Double] {
-        let lower = context.lowercased()
-        var scores: [String: Double] = [
-            "the": 0.4, "you": 0.36, "and": 0.31, "to": 0.29, "for": 0.28,
-            "tomorrow": 0.75, "tonight": 0.7, "definitely": 0.72, "probably": 0.68,
-            "meeting": 0.65, "dinner": 0.62, "report": 0.6, "amazing": 0.58
-        ]
-
-        if lower.contains("work") || lower.contains("meeting") {
-            scores["deck"] = 0.8
-            scores["qbr"] = 0.77
-            scores["report"] = 0.74
-        }
-
-        if lower.contains("dinner") || lower.contains("tonight") {
-            scores["sarita"] = 0.82
-            scores["restaurant"] = 0.76
-            scores["reservation"] = 0.7
-        }
-
-        return scores
-    }
-
     private func logAutocorrect(_ message: String) {
         #if DEBUG
         NSLog("[Keygram Autocorrect Engine] %@", message)
+        #endif
+    }
+
+    private func logInference(_ message: String) {
+        #if DEBUG
+        NSLog("[Keygram Inference] %@", message)
         #endif
     }
 
