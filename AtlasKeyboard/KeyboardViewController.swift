@@ -200,8 +200,21 @@ final class KeyboardViewController: UIInputViewController {
 
     private static func makeInferenceEngine() -> AtlasInferenceEngine {
         let warmupStart = CFAbsoluteTimeGetCurrent()
-        let runtime: AtlasModelRuntime? = nil
-        logServiceWarmup("ONNX runtime disabled in keyboard extension")
+        let runtimeStart = CFAbsoluteTimeGetCurrent()
+        let runtime: AtlasModelRuntime?
+        do {
+            runtime = try AtlasONNXModelRuntime()
+            logServiceWarmup(String(format: "ONNX runtime init %.3fs", CFAbsoluteTimeGetCurrent() - runtimeStart))
+        } catch {
+            runtime = nil
+            logServiceWarmup(
+                String(
+                    format: "ONNX runtime unavailable; using frequency fallback %.3fs error=%@",
+                    CFAbsoluteTimeGetCurrent() - runtimeStart,
+                    String(describing: error)
+                )
+            )
+        }
 
         let tokenizerStart = CFAbsoluteTimeGetCurrent()
         let tokenizer: AtlasTokenizing
@@ -854,7 +867,7 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     private func shouldUseInferenceSuggestions() -> Bool {
-        userDefaultsEnabled(AtlasConfiguration.inferenceSuggestionsEnabledKey, defaultValue: false)
+        userDefaultsEnabled(AtlasConfiguration.inferenceSuggestionsEnabledKey, defaultValue: true)
     }
 
     private func shouldUsePersonalizedTyping() -> Bool {
@@ -884,10 +897,18 @@ final class KeyboardViewController: UIInputViewController {
     private func refreshSuggestions() {
         let context = contextBeforeInput()
         let selectedWord = selectedCorrectionWord()
+        let shouldUseModel = shouldUseModelSuggestions(context: context, selectedWord: selectedWord)
+        guard shouldUseModel else {
+            suggestionGeneration += 1
+            needsSuggestionRefreshAfterInference = false
+            applySuggestions(lightweightSuggestions(context: context, selectedWord: selectedWord))
+            return
+        }
+
         guard let engine else {
             if shouldUseInferenceSuggestions(),
                shouldGenerateSuggestions(context: context, selectedWord: selectedWord) {
-                scheduleEngineLoadAfterTypingIdle()
+                loadEngineIfNeeded()
             }
             applySuggestions(lightweightSuggestions(context: context, selectedWord: selectedWord))
             return
@@ -895,8 +916,9 @@ final class KeyboardViewController: UIInputViewController {
 
         let rightContext = textDocumentProxy.documentContextAfterInput ?? ""
         let session = activeSession
+        let modelContext = selectedWord == nil ? nextWordPredictionContext(from: context) : context
         let request = SuggestionRequest(
-            context: context,
+            context: modelContext,
             selectedWord: selectedWord,
             rightContext: rightContext,
             sessionUpdatedAt: session.updatedAt
@@ -977,7 +999,7 @@ final class KeyboardViewController: UIInputViewController {
                 if let selectedWord {
                     self.logAutocorrect("no correction candidates for '\(selectedWord)'; falling back to normal suggestions")
                 }
-                suggestions = engine.suggestions(for: context, session: session, globalEngram: global)
+                suggestions = engine.suggestions(for: modelContext, session: session, globalEngram: global)
             }
 
             DispatchQueue.main.async {
@@ -1006,6 +1028,34 @@ final class KeyboardViewController: UIInputViewController {
         if selectedWord != nil { return true }
         return context.rangeOfCharacter(from: .letters) != nil
             || context.rangeOfCharacter(from: .decimalDigits) != nil
+    }
+
+    private func shouldUseModelSuggestions(context: String, selectedWord: String?) -> Bool {
+        guard shouldUseInferenceSuggestions() else { return false }
+        if selectedWord != nil { return true }
+        return endsInWhitespace(context)
+    }
+
+    private func endsInWhitespace(_ text: String) -> Bool {
+        guard let scalar = text.unicodeScalars.last else { return false }
+        return CharacterSet.whitespacesAndNewlines.contains(scalar)
+    }
+
+    private func nextWordPredictionContext(from context: String, maxWords: Int = 10) -> String {
+        guard maxWords > 0 else { return context }
+
+        var wordRanges: [Range<String.Index>] = []
+        context.enumerateSubstrings(in: context.startIndex..<context.endIndex, options: [.byWords]) { _, range, _, _ in
+            wordRanges.append(range)
+        }
+
+        guard wordRanges.count > maxWords,
+              let start = wordRanges.suffix(maxWords).first?.lowerBound
+        else {
+            return context
+        }
+
+        return String(context[start...])
     }
 
     private func lightweightSuggestions(context: String, selectedWord: String?) -> [AtlasSuggestion] {
@@ -1368,6 +1418,7 @@ final class KeyboardViewController: UIInputViewController {
             correction: decision.replacement.lowercased(),
             contextKey: contextKey
         )
+        scheduleSuggestionRefresh(after: 0)
     }
 
     private func lastTypedWordBeforeSpace() -> String? {
