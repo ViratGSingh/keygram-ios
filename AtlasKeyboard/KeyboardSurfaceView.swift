@@ -3,6 +3,7 @@ import UIKit
 protocol KeyboardSurfaceViewDelegate: AnyObject {
     func keyboardSurfaceView(_ view: KeyboardSurfaceView, didTap key: KeyboardKey, at point: CGPoint, touchStartedAt: CFTimeInterval, touchEndedAt: CFTimeInterval)
     func keyboardSurfaceView(_ view: KeyboardSurfaceView, didAccept suggestion: AtlasSuggestion, touchStartedAt: CFTimeInterval, touchEndedAt: CFTimeInterval)
+    func keyboardSurfaceView(_ view: KeyboardSurfaceView, preferredHeightDidChange height: CGFloat)
     func keyboardSurfaceViewDidLongPressBackspace(_ view: KeyboardSurfaceView)
     func keyboardSurfaceViewDidLongPressSession(_ view: KeyboardSurfaceView)
     func keyboardSurfaceViewDidRequestDismissKeyboard(_ view: KeyboardSurfaceView)
@@ -48,6 +49,8 @@ final class KeyboardSurfaceView: UIView {
         static let rowHeight: CGFloat = 52
         // 1 toolbar + 4 key rows + a little vertical slack.
         static let keyboardContentHeight: CGFloat = toolbarHeight + rowHeight * 4 + 8
+        static let emojiContentHeight: CGFloat = 330
+        static let emojiSearchContentHeight: CGFloat = 470
         static let buttonHorizontalInset: CGFloat = 3
         static let buttonVerticalInset: CGFloat = 4
     }
@@ -99,6 +102,12 @@ final class KeyboardSurfaceView: UIView {
     private var isCapsLocked = false
     private var returnKeyType: UIReturnKeyType = .default
     private var emojiPanelMode: EmojiPanelMode = .emojis
+    private var selectedEmojiCategoryIndex = 0
+    private var isEmojiSearchActive = false
+    private var emojiSearchQuery = ""
+    private var recentEmojis: [String] = []
+    private var visibleEmojiItems: [EmojiCatalogItem] = []
+    private var lastReportedPreferredHeight = LayoutMetric.keyboardContentHeight
     private let keyFeedback = UIImpactFeedbackGenerator(style: .light)
     private var hapticsEnabled = true
 
@@ -112,6 +121,12 @@ final class KeyboardSurfaceView: UIView {
     private enum EmojiPanelMode {
         case emojis
         case engrams
+    }
+
+    private struct EmojiDisplayCategory {
+        var name: String
+        var symbolName: String
+        var items: [EmojiCatalogItem]
     }
 
     private struct KeyLayout {
@@ -156,7 +171,7 @@ final class KeyboardSurfaceView: UIView {
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        let contentHeight = min(LayoutMetric.keyboardContentHeight, bounds.height)
+        let contentHeight = min(preferredHeightForCurrentMode, bounds.height)
         let contentWidth = keyboardContentWidth
         let contentFrame = CGRect(
             x: 0,
@@ -183,6 +198,18 @@ final class KeyboardSurfaceView: UIView {
 
     private var keyboardContentWidth: CGFloat {
         bounds.width
+    }
+
+    private var preferredHeightForCurrentMode: CGFloat {
+        guard keyboardMode == .emoji else { return LayoutMetric.keyboardContentHeight }
+        return isEmojiSearchActive ? LayoutMetric.emojiSearchContentHeight : LayoutMetric.emojiContentHeight
+    }
+
+    private func notifyPreferredHeightIfNeeded() {
+        let nextHeight = preferredHeightForCurrentMode
+        guard abs(nextHeight - lastReportedPreferredHeight) > 0.5 else { return }
+        lastReportedPreferredHeight = nextHeight
+        delegate?.keyboardSurfaceView(self, preferredHeightDidChange: nextHeight)
     }
 
     func prepareForTeardown() {
@@ -489,7 +516,7 @@ final class KeyboardSurfaceView: UIView {
         let hideToolbar = keyboardMode == .emoji
         toolbarSlot.isHidden = hideToolbar
         suggestionStack.isHidden = hideToolbar
-        keyStack.spacing = keyboardMode == .emoji ? 2 : 0
+        keyStack.spacing = keyboardMode == .emoji ? 6 : 0
         keyButtons.removeAll()
         keyRowHeightConstraints.removeAll()
         keyStack.arrangedSubviews.forEach { view in
@@ -510,6 +537,7 @@ final class KeyboardSurfaceView: UIView {
 
         setShiftState(isShifted, capsLocked: isCapsLocked)
         setReturnKeyType(returnKeyType)
+        notifyPreferredHeightIfNeeded()
         setNeedsLayout()
     }
 
@@ -518,85 +546,77 @@ final class KeyboardSurfaceView: UIView {
     }
 
     private func buildEmojiRows() {
-        // addEmojiSearchRow()
-        let topInset = UIView()
-        topInset.heightAnchor.constraint(equalToConstant: 8).isActive = true
-        keyStack.addArrangedSubview(topInset)
+        if isEmojiSearchActive {
+            addEmojiSearchTitle()
+            addEmojiSearchResults()
+            addEmojiSearchInputRow()
+            renderKeyLayout(emojiSearchKeyboardLayout)
+            return
+        }
 
-        addEmojiSectionLabel(emojiPanelMode == .engrams ? "Engrams" : "Emojis")
+        addEmojiSearchRow()
 
         switch emojiPanelMode {
         case .emojis:
-            addEmojiGrid()
+            addEmojiGrid(items: selectedEmojiItems())
+            addEmojiCategoryStrip()
         case .engrams:
-            keyStack.setCustomSpacing(8, after: keyStack.arrangedSubviews.last!)
+            addEmojiSectionLabel("Engrams")
             addEngramGrid()
         }
 
-        addEmojiToolbar()
+        addEmojiModeToolbar()
     }
 
-    private func addEmojiGrid() {
-        let scroll = UIScrollView()
-        scroll.showsHorizontalScrollIndicator = false
-        scroll.alwaysBounceHorizontal = true
-        scroll.heightAnchor.constraint(equalToConstant: 232).isActive = true
+    private func addEmojiGrid(items: [EmojiCatalogItem]) {
+        visibleEmojiItems = items
 
-        let grid = UIStackView()
-        grid.axis = .horizontal
-        grid.alignment = .top
-        grid.spacing = 6
-        grid.translatesAutoresizingMaskIntoConstraints = false
-        scroll.addSubview(grid)
+        let layout = UICollectionViewFlowLayout()
+        layout.scrollDirection = .horizontal
+        layout.itemSize = CGSize(width: 44, height: 32)
+        layout.minimumInteritemSpacing = 2
+        layout.minimumLineSpacing = 6
+        layout.sectionInset = UIEdgeInsets(top: 2, left: 18, bottom: 2, right: 18)
 
-        NSLayoutConstraint.activate([
-            grid.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor, constant: 0),
-            grid.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor),
-            grid.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor),
-            grid.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor),
-            grid.heightAnchor.constraint(equalTo: scroll.frameLayoutGuide.heightAnchor)
-        ])
+        let collection = UICollectionView(frame: .zero, collectionViewLayout: layout)
+        collection.backgroundColor = .clear
+        collection.showsHorizontalScrollIndicator = false
+        collection.alwaysBounceHorizontal = true
+        collection.dataSource = self
+        collection.delegate = self
+        collection.register(EmojiCell.self, forCellWithReuseIdentifier: EmojiCell.reuseIdentifier)
+        let height = collection.heightAnchor.constraint(equalToConstant: 138)
+        height.priority = .defaultHigh
+        height.isActive = true
 
-        let emojis = [
-            "😓", "🥱", "😶", "😵", "😟", "😴", "😵‍💫", "😝", "🤠",
-            "🤗", "🫡", "🫥", "😁", "😮", "🤤", "🤐", "😷", "😈",
-            "🤔", "🤫", "😐", "🙄", "😯", "😪", "😏", "🤒", "😠",
-            "🫣", "🫠", "😑", "😮‍💨", "🥱", "😔", "🤢", "🤕", "👹",
-            "🫢", "🤥", "😑", "☹️", "🥺", "😵", "🤮", "🤑", "👺",
-            "😀", "😃", "😄", "😆", "😉", "😊", "😍", "😘", "😋",
-            "😜", "🤪", "😎", "🥳", "😇", "🙂", "🙃", "😂", "🤣",
-            "❤️", "🧡", "💛", "💚", "💙", "💜", "🖤", "🤍", "💔",
-            "👍", "👎", "👏", "🙌", "🙏", "🤝", "💪", "👌", "✌️",
-            "👋", "🤚", "🖐️", "✋", "👊", "🤟", "🤘", "☝️", "👇",
-            "👀", "🧠", "👑", "💍", "💼", "🎒", "🕶️", "🎓", "💄",
-            "🐶", "🐱", "🐭", "🐹", "🐰", "🦊", "🐻", "🐼", "🐨",
-            "🐯", "🦁", "🐮", "🐷", "🐸", "🐵", "🐔", "🐧", "🐦",
-            "🍎", "🍊", "🍋", "🍌", "🍉", "🍇", "🍓", "🫐", "🥝",
-            "🍕", "🍔", "🍟", "🌮", "🍜", "🍣", "🍩", "🍪", "🎂",
-            "⚽️", "🏀", "🏈", "⚾️", "🎾", "🏐", "🎱", "🏓", "🏸",
-            "🚗", "🚕", "🚌", "🚑", "🚒", "🚲", "✈️", "🚀", "⛵️",
-            "🏠", "🏢", "🏥", "🏫", "🏨", "🏦", "⛪️", "🕌", "🛕",
-            "⌚️", "📱", "💻", "⌨️", "🖥️", "🖨️", "📷", "🎥", "🎧",
-            "💡", "🔦", "🧯", "🛠️", "🔑", "🎁", "🎈", "🎉", "🪄",
-            "✅", "❌", "❗️", "❓", "⭐️", "🔥", "💧", "🌈", "☀️"
-        ]
+        keyStack.addArrangedSubview(collection)
+    }
 
-        let rowsPerColumn = 5
-        for columnStart in stride(from: 0, to: emojis.count, by: rowsPerColumn) {
-            let column = UIStackView()
-            column.axis = .vertical
-            column.spacing = 4
-            column.distribution = .fillEqually
-            column.widthAnchor.constraint(equalToConstant: 36).isActive = true
-
-            for index in columnStart..<min(columnStart + rowsPerColumn, emojis.count) {
-                column.addArrangedSubview(makeEmojiKey(emojis[index]))
-            }
-
-            grid.addArrangedSubview(column)
+    private func selectedEmojiItems() -> [EmojiCatalogItem] {
+        let categories = emojiDisplayCategories()
+        guard categories.indices.contains(selectedEmojiCategoryIndex) else {
+            selectedEmojiCategoryIndex = min(max(0, selectedEmojiCategoryIndex), max(0, categories.count - 1))
+            return categories.first?.items ?? []
         }
+        return categories[selectedEmojiCategoryIndex].items
+    }
 
-        keyStack.addArrangedSubview(scroll)
+    private func emojiDisplayCategories() -> [EmojiDisplayCategory] {
+        var categories: [EmojiDisplayCategory] = []
+        let recentItems = recentEmojiItems()
+        if !recentItems.isEmpty {
+            categories.append(EmojiDisplayCategory(name: "Recent", symbolName: "clock.fill", items: recentItems))
+        }
+        categories += EmojiCatalog.categories.map {
+            EmojiDisplayCategory(name: $0.name, symbolName: $0.symbolName, items: $0.items)
+        }
+        return categories
+    }
+
+    private func recentEmojiItems() -> [EmojiCatalogItem] {
+        let fallback = ["😀", "😁", "😅", "🙂", "😇", "😉", "🥰", "😘", "😛", "😂", "😊", "😍", "👍", "🎉", "🔥", "✨", "❤️", "🙏"]
+        let values = recentEmojis.isEmpty ? fallback : recentEmojis
+        return values.map { EmojiCatalogItem(value: $0, name: "recent emoji", subgroup: "recent") }
     }
 
     private func addEngramGrid() {
@@ -665,37 +685,134 @@ final class KeyboardSurfaceView: UIView {
     }
 
     private func addEmojiSearchRow() {
-        let search = UIView()
+        let container = UIView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+
+        let search = UIButton(type: .system)
         search.backgroundColor = UIColor { trait in
-            trait.userInterfaceStyle == .dark ? UIColor(red: 0.18, green: 0.19, blue: 0.21, alpha: 1) : UIColor(red: 239 / 255, green: 241 / 255, blue: 245 / 255, alpha: 1)
+            trait.userInterfaceStyle == .dark ? UIColor(red: 0.25, green: 0.25, blue: 0.26, alpha: 1) : UIColor(red: 239 / 255, green: 241 / 255, blue: 245 / 255, alpha: 1)
         }
         search.layer.cornerRadius = 22
+        search.clipsToBounds = true
         search.translatesAutoresizingMaskIntoConstraints = false
-        search.heightAnchor.constraint(equalToConstant: 46).isActive = true
+        search.heightAnchor.constraint(equalToConstant: 48).isActive = true
+        search.addTarget(self, action: #selector(emojiSearchTapped), for: .touchUpInside)
+        container.addSubview(search)
 
-        let icon = UIImageView(image: UIImage(systemName: "magnifyingglass"))
-        icon.tintColor = .secondaryLabel
-        icon.translatesAutoresizingMaskIntoConstraints = false
-        search.addSubview(icon)
+        let brand = UILabel()
+        brand.text = "K"
+        brand.font = .systemFont(ofSize: 20, weight: .bold)
+        brand.textColor = .white
+        brand.textAlignment = .center
+        brand.backgroundColor = .systemBlue
+        brand.layer.cornerRadius = 15
+        brand.clipsToBounds = true
+        brand.translatesAutoresizingMaskIntoConstraints = false
+        search.addSubview(brand)
 
         let label = UILabel()
-        label.text = "Search Emoji"
-        label.font = .systemFont(ofSize: 22, weight: .regular)
+        label.text = "Search emojis"
+        label.font = .systemFont(ofSize: 18, weight: .regular)
         label.textColor = .secondaryLabel
         label.translatesAutoresizingMaskIntoConstraints = false
         search.addSubview(label)
 
         NSLayoutConstraint.activate([
-            icon.leadingAnchor.constraint(equalTo: search.leadingAnchor, constant: 20),
-            icon.centerYAnchor.constraint(equalTo: search.centerYAnchor),
-            icon.widthAnchor.constraint(equalToConstant: 24),
-            icon.heightAnchor.constraint(equalToConstant: 24),
-            label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 12),
+            brand.leadingAnchor.constraint(equalTo: search.leadingAnchor, constant: 18),
+            brand.centerYAnchor.constraint(equalTo: search.centerYAnchor),
+            brand.widthAnchor.constraint(equalToConstant: 30),
+            brand.heightAnchor.constraint(equalToConstant: 30),
+            label.leadingAnchor.constraint(equalTo: brand.trailingAnchor, constant: 12),
             label.centerYAnchor.constraint(equalTo: search.centerYAnchor),
             label.trailingAnchor.constraint(lessThanOrEqualTo: search.trailingAnchor, constant: -16)
         ])
 
-        keyStack.addArrangedSubview(search)
+        NSLayoutConstraint.activate([
+            search.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 20),
+            search.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -20),
+            search.topAnchor.constraint(equalTo: container.topAnchor, constant: 10),
+            search.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+        ])
+
+        keyStack.addArrangedSubview(container)
+    }
+
+    private func addEmojiSearchTitle() {
+        let label = UILabel()
+        label.text = "Keygram"
+        label.textAlignment = .center
+        label.textColor = .label
+        label.font = .systemFont(ofSize: 28, weight: .semibold)
+        label.heightAnchor.constraint(equalToConstant: 42).isActive = true
+        keyStack.addArrangedSubview(label)
+    }
+
+    private func addEmojiSearchResults() {
+        addEmojiGrid(items: filteredEmojiSearchItems())
+    }
+
+    private func addEmojiSearchInputRow() {
+        let container = UIView()
+        container.backgroundColor = UIColor { trait in
+            trait.userInterfaceStyle == .dark ? UIColor(red: 0.25, green: 0.25, blue: 0.26, alpha: 1) : UIColor(red: 239 / 255, green: 241 / 255, blue: 245 / 255, alpha: 1)
+        }
+        container.layer.cornerRadius = 16
+        container.clipsToBounds = true
+        container.heightAnchor.constraint(equalToConstant: 46).isActive = true
+
+        let back = UIButton(type: .system)
+        back.setImage(UIImage(systemName: "arrow.left"), for: .normal)
+        back.tintColor = .label
+        back.translatesAutoresizingMaskIntoConstraints = false
+        back.addTarget(self, action: #selector(emojiSearchBackTapped), for: .touchUpInside)
+        container.addSubview(back)
+
+        let label = UILabel()
+        label.text = emojiSearchQuery.isEmpty ? "Search emojis" : emojiSearchQuery
+        label.textColor = emojiSearchQuery.isEmpty ? .secondaryLabel : .label
+        label.font = .systemFont(ofSize: 18, weight: .regular)
+        label.lineBreakMode = .byTruncatingTail
+        label.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(label)
+
+        let clear = UIButton(type: .system)
+        clear.setImage(UIImage(systemName: "xmark.circle.fill"), for: .normal)
+        clear.tintColor = .label
+        clear.alpha = emojiSearchQuery.isEmpty ? 0.35 : 1
+        clear.translatesAutoresizingMaskIntoConstraints = false
+        clear.addTarget(self, action: #selector(emojiSearchClearTapped), for: .touchUpInside)
+        container.addSubview(clear)
+
+        NSLayoutConstraint.activate([
+            back.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 10),
+            back.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            back.widthAnchor.constraint(equalToConstant: 38),
+            back.heightAnchor.constraint(equalToConstant: 38),
+            label.leadingAnchor.constraint(equalTo: back.trailingAnchor, constant: 10),
+            label.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            clear.leadingAnchor.constraint(greaterThanOrEqualTo: label.trailingAnchor, constant: 8),
+            clear.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
+            clear.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            clear.widthAnchor.constraint(equalToConstant: 34),
+            clear.heightAnchor.constraint(equalToConstant: 34)
+        ])
+
+        keyStack.addArrangedSubview(container)
+    }
+
+    private func filteredEmojiSearchItems() -> [EmojiCatalogItem] {
+        let query = emojiSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !query.isEmpty else {
+            return EmojiCatalog.searchItems.prefix(36).map { $0.item }
+        }
+
+        let terms = query.split(separator: " ").map(String.init)
+        return EmojiCatalog.searchItems.compactMap { entry in
+            let haystack = "\(entry.item.name) \(entry.item.subgroup) \(entry.categoryName)".lowercased()
+            return terms.allSatisfy { haystack.contains($0) } ? entry.item : nil
+        }
+        .prefix(54)
+        .map { $0 }
     }
 
     private func addEmojiSectionLabel(_ title: String) {
@@ -707,47 +824,78 @@ final class KeyboardSurfaceView: UIView {
         keyStack.addArrangedSubview(label)
     }
 
-    private func addEmojiToolbar() {
+    private func addEmojiCategoryStrip() {
+        let categories = emojiDisplayCategories()
+        if selectedEmojiCategoryIndex >= categories.count {
+            selectedEmojiCategoryIndex = max(0, categories.count - 1)
+        }
+
+        let scroll = UIScrollView()
+        scroll.showsHorizontalScrollIndicator = false
+        scroll.alwaysBounceHorizontal = true
+        scroll.heightAnchor.constraint(equalToConstant: 46).isActive = true
+
+        let row = UIStackView()
+        row.axis = .horizontal
+        row.alignment = .center
+        row.spacing = 14
+        row.translatesAutoresizingMaskIntoConstraints = false
+        scroll.addSubview(row)
+
+        NSLayoutConstraint.activate([
+            row.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor, constant: 18),
+            row.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor, constant: -18),
+            row.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor),
+            row.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor),
+            row.heightAnchor.constraint(equalTo: scroll.frameLayoutGuide.heightAnchor)
+        ])
+
+        for (index, category) in categories.enumerated() {
+            let selected = index == selectedEmojiCategoryIndex
+            let button = makeEmojiCategoryButton(systemName: category.symbolName, selected: selected)
+            button.tag = index
+            button.addTarget(self, action: #selector(emojiCategoryIndexTapped(_:)), for: .touchUpInside)
+            row.addArrangedSubview(button)
+        }
+
+        keyStack.addArrangedSubview(scroll)
+    }
+
+    private func addEmojiModeToolbar() {
         let toolbar = UIStackView()
         toolbar.axis = .horizontal
         toolbar.alignment = .center
-        toolbar.spacing = 12
+        toolbar.spacing = 10
         toolbar.distribution = .fill
-        toolbar.heightAnchor.constraint(equalToConstant: 44).isActive = true
+        toolbar.heightAnchor.constraint(equalToConstant: 48).isActive = true
 
-        toolbar.addArrangedSubview(makeKey(.modeToggle, title: "ABC", width: 58))
+        let abc = makeKey(.modeToggle, title: "ABC", width: 72)
+        abc.backgroundColor = .clear
+        abc.titleLabel?.font = .systemFont(ofSize: 24, weight: .regular)
+        toolbar.addArrangedSubview(abc)
 
-        let categoryScroll = UIScrollView()
-        categoryScroll.showsHorizontalScrollIndicator = false
-        categoryScroll.alwaysBounceHorizontal = true
-        categoryScroll.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        toolbar.addArrangedSubview(FlexibleSpacerView())
 
-        let categoryRow = UIStackView()
-        categoryRow.axis = .horizontal
-        categoryRow.alignment = .center
-        categoryRow.spacing = 8
-        categoryRow.translatesAutoresizingMaskIntoConstraints = false
-        categoryScroll.addSubview(categoryRow)
-
-        NSLayoutConstraint.activate([
-            categoryRow.leadingAnchor.constraint(equalTo: categoryScroll.contentLayoutGuide.leadingAnchor),
-            categoryRow.trailingAnchor.constraint(equalTo: categoryScroll.contentLayoutGuide.trailingAnchor),
-            categoryRow.topAnchor.constraint(equalTo: categoryScroll.contentLayoutGuide.topAnchor),
-            categoryRow.bottomAnchor.constraint(equalTo: categoryScroll.contentLayoutGuide.bottomAnchor),
-            categoryRow.heightAnchor.constraint(equalTo: categoryScroll.frameLayoutGuide.heightAnchor)
-        ])
-
-        // let personButton = makeEmojiCategoryButton(systemName: "person.crop.circle", selected: emojiPanelMode == .engrams)
-        // personButton.addTarget(self, action: #selector(engramCategoryTapped), for: .touchUpInside)
-        // categoryRow.addArrangedSubview(personButton)
-
-        let emojiButton = makeEmojiCategoryButton(systemName: "face.smiling", selected: emojiPanelMode == .emojis)
+        let emojiButton = makeEmojiModeButton(systemName: "face.smiling", title: nil, selected: emojiPanelMode == .emojis)
         emojiButton.addTarget(self, action: #selector(emojiCategoryTapped), for: .touchUpInside)
-        categoryRow.addArrangedSubview(emojiButton)
+        toolbar.addArrangedSubview(emojiButton)
 
-        toolbar.addArrangedSubview(categoryScroll)
+        let stickerButton = makeEmojiModeButton(systemName: "face.smiling.inverse", title: nil, selected: false)
+        stickerButton.isEnabled = false
+        toolbar.addArrangedSubview(stickerButton)
+
+        let gifButton = makeEmojiModeButton(systemName: nil, title: "GIF", selected: false)
+        gifButton.isEnabled = false
+        toolbar.addArrangedSubview(gifButton)
+
+        let emoticonButton = makeEmojiModeButton(systemName: nil, title: ":-)", selected: false)
+        emoticonButton.isEnabled = false
+        toolbar.addArrangedSubview(emoticonButton)
+
+        toolbar.addArrangedSubview(FlexibleSpacerView())
 
         let backspace = makeKey(.backspace, title: "delete.left", width: 48)
+        backspace.backgroundColor = .clear
         backspace.addGestureRecognizer(UILongPressGestureRecognizer(target: self, action: #selector(backspaceLongPressed(_:))))
         toolbar.addArrangedSubview(backspace)
 
@@ -818,6 +966,27 @@ final class KeyboardSurfaceView: UIView {
                 .key(.globe, width: .inputPercentage(1.23)),
                 .key(.space, width: .available),
                 .key(.returnKey, width: .percentage(0.25)),
+            ],
+        ])
+    }
+
+    private var emojiSearchKeyboardLayout: KeyLayout {
+        KeyLayout(itemRows: [
+            inputRow("qwertyuiop"),
+            [.spacer(width: .inputPercentage(0.5))] + inputItems("asdfghjkl") + [.spacer(width: .inputPercentage(0.5))],
+            [
+                .key(.shift, width: .inputPercentage(1.3)),
+                .spacer(),
+            ] + inputItems("zxcvbnm") + [
+                .spacer(),
+                .key(.backspace, width: .inputPercentage(1.3)),
+            ],
+            [
+                .key(.modeToggle, title: "123", width: .inputPercentage(1.23)),
+                .key(.globe, width: .inputPercentage(1.23)),
+                .key(.space, width: .available),
+                .key(.character("."), title: ".", width: .inputPercentage(1.0)),
+                .key(.returnKey, title: "Search", width: .percentage(0.28)),
             ],
         ])
     }
@@ -1176,11 +1345,17 @@ final class KeyboardSurfaceView: UIView {
             button.setImage(UIImage(systemName: imageName), for: .normal)
             button.tintColor = .label
         }
-        button.titleLabel?.font = .systemFont(ofSize: key == .space || key == .modeToggle || key == .symbolToggle ? 15 : 22, weight: .regular)
+        let fontSize: CGFloat
+        if isEmojiSearchActive && key == .returnKey {
+            fontSize = 18
+        } else {
+            fontSize = key == .space || key == .modeToggle || key == .symbolToggle ? 15 : 22
+        }
+        button.titleLabel?.font = .systemFont(ofSize: fontSize, weight: isEmojiSearchActive && key == .returnKey ? .semibold : .regular)
         button.layer.cornerRadius = 5
         button.layer.cornerCurve = .continuous
         button.backgroundColor = keyBackground(for: key)
-        button.setTitleColor(.label, for: .normal)
+        button.setTitleColor(isEmojiSearchActive && key == .returnKey ? .white : .label, for: .normal)
         button.addTarget(self, action: #selector(keyTouchDown(_:)), for: .touchDown)
         button.addTarget(self, action: #selector(keyTapped(_:)), for: .touchUpInside)
         button.addTarget(self, action: #selector(keyTouchCancelled(_:)), for: [.touchUpOutside, .touchCancel, .touchDragExit])
@@ -1196,9 +1371,11 @@ final class KeyboardSurfaceView: UIView {
 
     private func makeEmojiKey(_ emoji: String) -> KeyboardButton {
         let button = KeyboardButton(key: .character(emoji))
+        button.accessibilityIdentifier = "emoji-key"
         button.setTitle(emoji, for: .normal)
-        button.titleLabel?.font = .systemFont(ofSize: 31)
-        button.contentHorizontalAlignment = .leading
+        button.titleLabel?.font = .systemFont(ofSize: 34)
+        button.contentHorizontalAlignment = .center
+        button.contentVerticalAlignment = .center
         button.backgroundColor = .clear
         button.layer.cornerRadius = 8
         button.addTarget(self, action: #selector(keyTouchDown(_:)), for: .touchDown)
@@ -1241,13 +1418,32 @@ final class KeyboardSurfaceView: UIView {
     private func makeEmojiCategoryButton(systemName: String, selected: Bool) -> UIButton {
         let button = UIButton(type: .system)
         button.setImage(UIImage(systemName: systemName), for: .normal)
-        button.tintColor = selected ? .label : .secondaryLabel
+        button.tintColor = .label
         button.backgroundColor = selected ? UIColor { trait in
-            trait.userInterfaceStyle == .dark ? UIColor(red: 0.32, green: 0.33, blue: 0.36, alpha: 1) : UIColor(red: 207 / 255, green: 211 / 255, blue: 219 / 255, alpha: 1)
+            trait.userInterfaceStyle == .dark ? UIColor(red: 0.32, green: 0.33, blue: 0.35, alpha: 1) : UIColor(red: 207 / 255, green: 211 / 255, blue: 219 / 255, alpha: 1)
         } : .clear
-        button.layer.cornerRadius = 22
-        button.widthAnchor.constraint(equalToConstant: 44).isActive = true
-        button.heightAnchor.constraint(equalToConstant: 44).isActive = true
+        button.alpha = selected ? 1 : 0.95
+        button.layer.cornerRadius = 20
+        button.widthAnchor.constraint(equalToConstant: 40).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 40).isActive = true
+        button.imageView?.contentMode = .scaleAspectFit
+        return button
+    }
+
+    private func makeEmojiModeButton(systemName: String?, title: String?, selected: Bool) -> UIButton {
+        let button = UIButton(type: .system)
+        if let systemName {
+            button.setImage(UIImage(systemName: systemName), for: .normal)
+        }
+        if let title {
+            button.setTitle(title, for: .normal)
+            button.titleLabel?.font = .systemFont(ofSize: 20, weight: .bold)
+        }
+        button.tintColor = selected ? .systemBlue : .label
+        button.setTitleColor(selected ? .systemBlue : .label, for: .normal)
+        button.alpha = button.isEnabled ? 1 : 0.95
+        button.widthAnchor.constraint(equalToConstant: 48).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 48).isActive = true
         return button
     }
 
@@ -1260,6 +1456,7 @@ final class KeyboardSurfaceView: UIView {
         case .globe:
             return "face.smiling"
         case .returnKey:
+            if isEmojiSearchActive { return nil }
             return returnKeyIconName(for: returnKeyType)
         default:
             return nil
@@ -1280,6 +1477,9 @@ final class KeyboardSurfaceView: UIView {
     private func displayTitle(for key: KeyboardKey, fallback: String) -> String {
         switch key {
         case .shift, .backspace, .globe, .returnKey:
+            if isEmojiSearchActive && key == .returnKey {
+                return "Search"
+            }
             return ""
         case .modeToggle:
             return keyboardMode == .letters ? "123" : "ABC"
@@ -1297,6 +1497,8 @@ final class KeyboardSurfaceView: UIView {
             switch key {
             case .character, .space:
                 return trait.userInterfaceStyle == .dark ? UIColor(red: 0.23, green: 0.24, blue: 0.26, alpha: 1) : .white
+            case .returnKey where self.isEmojiSearchActive:
+                return UIColor.systemBlue
             default:
                 return trait.userInterfaceStyle == .dark ? UIColor(red: 0.32, green: 0.33, blue: 0.35, alpha: 1) : UIColor(red: 174 / 255, green: 179 / 255, blue: 189 / 255, alpha: 1)
             }
@@ -1338,13 +1540,21 @@ final class KeyboardSurfaceView: UIView {
 
     @objc private func keyTapped(_ sender: KeyboardButton) {
         let touchTiming = consumeTouchTiming(for: sender)
+        if isEmojiSearchActive {
+            handleEmojiSearchKeyTap(sender, touchTiming: touchTiming)
+            return
+        }
         if sender.key == .globe {
             emojiPanelMode = .emojis
+            isEmojiSearchActive = false
             keyboardMode = .emoji
             UIView.performWithoutAnimation { rebuildKeyboardRows() }
             return
         }
         if sender.key == .modeToggle {
+            if keyboardMode == .emoji {
+                isEmojiSearchActive = false
+            }
             keyboardMode = keyboardMode == .letters ? .numbers : .letters
             UIView.performWithoutAnimation { rebuildKeyboardRows() }
             return
@@ -1371,7 +1581,58 @@ final class KeyboardSurfaceView: UIView {
         )
         #endif
 
+        if sender.accessibilityIdentifier == "emoji-key",
+           case .character(let value) = sender.key {
+            rememberEmoji(value)
+        }
         delegate?.keyboardSurfaceView(self, didTap: sender.key, at: tapPoint, touchStartedAt: touchTiming.startedAt, touchEndedAt: touchTiming.endedAt)
+    }
+
+    private func handleEmojiSearchKeyTap(_ sender: KeyboardButton, touchTiming: (startedAt: CFTimeInterval, endedAt: CFTimeInterval)) {
+        if sender.accessibilityIdentifier == "emoji-key" {
+            submitEmojiKey(sender, touchTiming: touchTiming)
+            return
+        }
+
+        switch sender.key {
+        case .character(let value):
+            emojiSearchQuery.append(value.lowercased())
+            UIView.performWithoutAnimation { rebuildKeyboardRows() }
+        case .space:
+            emojiSearchQuery.append(" ")
+            UIView.performWithoutAnimation { rebuildKeyboardRows() }
+        case .backspace:
+            guard !emojiSearchQuery.isEmpty else { return }
+            emojiSearchQuery.removeLast()
+            UIView.performWithoutAnimation { rebuildKeyboardRows() }
+        case .shift:
+            isShifted.toggle()
+            setShiftState(isShifted, capsLocked: isCapsLocked)
+        case .returnKey:
+            break
+        case .globe:
+            isEmojiSearchActive = false
+            UIView.performWithoutAnimation { rebuildKeyboardRows() }
+        case .modeToggle, .symbolToggle:
+            break
+        }
+    }
+
+    private func submitEmojiKey(_ sender: KeyboardButton, touchTiming: (startedAt: CFTimeInterval, endedAt: CFTimeInterval)) {
+        let tapPoint = sender.latestTouchLocation(in: self)
+            ?? sender.convert(CGPoint(x: sender.bounds.midX, y: sender.bounds.midY), to: self)
+        if case .character(let value) = sender.key {
+            rememberEmoji(value)
+        }
+        delegate?.keyboardSurfaceView(self, didTap: sender.key, at: tapPoint, touchStartedAt: touchTiming.startedAt, touchEndedAt: touchTiming.endedAt)
+    }
+
+    private func rememberEmoji(_ emoji: String) {
+        recentEmojis.removeAll { $0 == emoji }
+        recentEmojis.insert(emoji, at: 0)
+        if recentEmojis.count > 36 {
+            recentEmojis.removeLast(recentEmojis.count - 36)
+        }
     }
 
     private func triggerKeyFeedback() {
@@ -1443,12 +1704,41 @@ final class KeyboardSurfaceView: UIView {
 
     @objc private func engramCategoryTapped() {
         emojiPanelMode = .engrams
+        isEmojiSearchActive = false
         rebuildKeyboardRows()
     }
 
     @objc private func emojiCategoryTapped() {
         emojiPanelMode = .emojis
+        isEmojiSearchActive = false
+        selectedEmojiCategoryIndex = min(selectedEmojiCategoryIndex, max(0, emojiDisplayCategories().count - 1))
         rebuildKeyboardRows()
+    }
+
+    @objc private func emojiCategoryIndexTapped(_ sender: UIButton) {
+        selectedEmojiCategoryIndex = sender.tag
+        emojiPanelMode = .emojis
+        isEmojiSearchActive = false
+        rebuildKeyboardRows()
+    }
+
+    @objc private func emojiSearchTapped() {
+        emojiPanelMode = .emojis
+        isEmojiSearchActive = true
+        emojiSearchQuery = ""
+        UIView.performWithoutAnimation { rebuildKeyboardRows() }
+    }
+
+    @objc private func emojiSearchBackTapped() {
+        isEmojiSearchActive = false
+        emojiSearchQuery = ""
+        UIView.performWithoutAnimation { rebuildKeyboardRows() }
+    }
+
+    @objc private func emojiSearchClearTapped() {
+        guard !emojiSearchQuery.isEmpty else { return }
+        emojiSearchQuery = ""
+        UIView.performWithoutAnimation { rebuildKeyboardRows() }
     }
 
     @objc private func engramButtonTapped(_ sender: UIButton) {
@@ -1601,6 +1891,73 @@ extension KeyboardSurfaceView {
         case .shift, .backspace, .returnKey, .globe, .modeToggle, .symbolToggle:
             return nil
         }
+    }
+}
+
+extension KeyboardSurfaceView: UICollectionViewDataSource, UICollectionViewDelegateFlowLayout {
+    func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int) -> Int {
+        visibleEmojiItems.count
+    }
+
+    func collectionView(_ collectionView: UICollectionView, cellForItemAt indexPath: IndexPath) -> UICollectionViewCell {
+        let cell = collectionView.dequeueReusableCell(withReuseIdentifier: EmojiCell.reuseIdentifier, for: indexPath)
+        guard let emojiCell = cell as? EmojiCell,
+              visibleEmojiItems.indices.contains(indexPath.item)
+        else { return cell }
+
+        emojiCell.configure(with: visibleEmojiItems[indexPath.item].value)
+        return emojiCell
+    }
+
+    func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
+        guard visibleEmojiItems.indices.contains(indexPath.item),
+              let cell = collectionView.cellForItem(at: indexPath)
+        else { return }
+
+        let emoji = visibleEmojiItems[indexPath.item].value
+        rememberEmoji(emoji)
+        triggerKeyFeedback()
+
+        let point = cell.convert(CGPoint(x: cell.bounds.midX, y: cell.bounds.midY), to: self)
+        let now = CACurrentMediaTime()
+        delegate?.keyboardSurfaceView(self, didTap: .character(emoji), at: point, touchStartedAt: now, touchEndedAt: now)
+    }
+}
+
+private final class EmojiCell: UICollectionViewCell {
+    static let reuseIdentifier = "EmojiCell"
+
+    private let label = UILabel()
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        contentView.backgroundColor = .clear
+
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.textAlignment = .center
+        label.font = .systemFont(ofSize: 28)
+        contentView.addSubview(label)
+
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            label.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            label.topAnchor.constraint(equalTo: contentView.topAnchor),
+            label.bottomAnchor.constraint(equalTo: contentView.bottomAnchor)
+        ])
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var isHighlighted: Bool {
+        didSet {
+            contentView.alpha = isHighlighted ? 0.72 : 1
+        }
+    }
+
+    func configure(with emoji: String) {
+        label.text = emoji
     }
 }
 

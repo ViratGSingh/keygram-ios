@@ -9,7 +9,7 @@ import CoreGraphics
 ///
 /// The Gaussian is updated online via exponential moving average (EMA) so it
 /// adapts to the user without storing every historical tap.
-struct KeyGaussian: Codable {
+nonisolated struct KeyGaussian: Codable, Sendable {
     /// Average tap X position for this key, in keyboard-local coordinates (points).
     var meanX: Double
     /// Average tap Y position for this key.

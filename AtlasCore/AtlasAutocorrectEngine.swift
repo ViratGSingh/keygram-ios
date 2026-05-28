@@ -75,21 +75,25 @@ final class AtlasAutocorrectEngine {
         guard token.isEligible(in: leftContext) else { return nil }
 
         let normalized = token.normalized
-        guard !lexicon.contains(normalized) else { return nil }
+        let isDictionaryWord = lexicon.contains(normalized)
         let isPersonalKnownWord = sessionEngram.containsConfirmed(normalized) || globalEngram.containsConfirmed(normalized)
-        guard !isPersonalKnownWord else { return nil }
 
-        if let exactSplitDecision = exactSplitCorrection(for: normalized) {
-            return AtlasAutocorrectDecision(
-                original: typedWord,
-                replacement: token.preserveCase(applying: exactSplitDecision.replacement),
-                confidence: exactSplitDecision.confidence,
-                margin: exactSplitDecision.margin
-            )
+        var candidates = candidates(for: normalized, sessionEngram: sessionEngram, globalEngram: globalEngram)
+        if isDictionaryWord {
+            guard !isPersonalKnownWord else { return nil }
+            candidates = candidates.filter { candidate in
+                shouldCorrectKnownDictionaryWord(typed: normalized, candidate: candidate)
+            }
+            guard !candidates.isEmpty else { return nil }
         }
-
-        let candidates = candidates(for: normalized, sessionEngram: sessionEngram, globalEngram: globalEngram)
-        var splitDecision: SplitCorrectionCandidate?
+        if isPersonalKnownWord {
+            let hasCloseDictionaryCandidate = candidates.contains { candidate in
+                lexicon.contains(candidate)
+                    && AtlasSpellingMetrics.editDistance(normalized, candidate, maxDistance: 1) != nil
+            }
+            guard hasCloseDictionaryCandidate else { return nil }
+        }
+        var splitDecision = exactSplitCorrection(for: normalized)
         if !candidates.isEmpty {
             var ranked: [RankedCandidate] = []
             ranked.reserveCapacity(candidates.count)
@@ -171,6 +175,32 @@ final class AtlasAutocorrectEngine {
         return lexicon.contains(normalized) || sessionEngram.containsConfirmed(normalized) || globalEngram.containsConfirmed(normalized)
     }
 
+    func completions(
+        for partialWord: String,
+        leftContext: String,
+        sessionEngram: Engram,
+        globalEngram: Engram
+    ) -> [AtlasSuggestion] {
+        let normalized = AtlasAutocorrectToken(rawValue: partialWord).normalized
+        guard !normalized.isEmpty else { return [] }
+
+        let candidates = lexicon.completions(for: normalized, limit: AtlasConfiguration.maxSuggestions * 4)
+            + sessionEngram.completions(matching: normalized, limit: AtlasConfiguration.maxSuggestions)
+            + globalEngram.completions(matching: normalized, limit: AtlasConfiguration.maxSuggestions)
+
+        let ranked: [AtlasSuggestion] = candidates.map { candidate in
+            let frequencyScore = min(0.35, log(lexicon.frequency(for: candidate)) * 0.03)
+            let personalScore = sessionEngram.bias(for: candidate, context: leftContext)
+            let globalScore = globalEngram.bias(for: candidate, context: leftContext) * 0.75
+            let score = 0.4 + frequencyScore + personalScore + globalScore
+            return AtlasSuggestion(text: candidate, kind: .completion, score: score)
+        }
+
+        let deduped = Dictionary(grouping: ranked, by: { $0.text.lowercased() })
+            .compactMap { $0.value.max { $0.score < $1.score } }
+        return Array(deduped.sorted { $0.score > $1.score }.prefix(AtlasConfiguration.maxSuggestions))
+    }
+
     func learningAssessment(for word: String) -> Engram.LearningAssessment {
         let normalized = AtlasAutocorrectToken(rawValue: word).normalized
         guard !normalized.isEmpty else { return Engram.LearningAssessment() }
@@ -224,6 +254,21 @@ final class AtlasAutocorrectEngine {
             }
             .prefix(10)
             .map(\.self)
+    }
+
+    private func shouldCorrectKnownDictionaryWord(typed: String, candidate: String) -> Bool {
+        guard lexicon.contains(candidate), typed.count == candidate.count else { return false }
+        guard AtlasSpellingMetrics.editDistance(typed, candidate, maxDistance: 1) == 1 else { return false }
+        guard keyboardDistancePenalty(typed: typed, candidate: candidate) <= 0.35 else { return false }
+
+        let typedFrequency = lexicon.frequency(for: typed)
+        let candidateFrequency = lexicon.frequency(for: candidate)
+        let adjacentTypoToVeryCommonWord = candidateFrequency >= 90_000
+            && candidateFrequency >= typedFrequency * 1.25
+        let strongFrequencyAdvantage = candidateFrequency >= typedFrequency * 3
+            || candidateFrequency - typedFrequency >= 50_000
+        let rareTypedWordToCommonCandidate = typedFrequency < 25_000 && candidateFrequency >= 45_000
+        return adjacentTypoToVeryCommonWord || strongFrequencyAdvantage || rareTypedWordToCommonCandidate
     }
 
     private func exactSplitCorrection(for word: String) -> SplitCorrectionCandidate? {
@@ -368,6 +413,7 @@ final class AtlasAutocorrectEngine {
             guard Self.strongTwoLetterSplitWords.contains(word) else { return false }
         } else {
             guard word.count >= 3 else { return false }
+            guard AtlasSplitWordPolicy.commonSplitWords.contains(word) else { return false }
         }
 
         return lexicon.contains(word) && lexicon.frequency(for: word) >= 16_000
@@ -602,13 +648,16 @@ private final class AtlasQuickSplitLexicon {
         let candidates = ((targetLength - maxDistance)...(targetLength + maxDistance))
             .flatMap { dictionaryWordsByLength[$0] ?? [] }
         return candidates.contains { candidate in
-            candidate != word && AtlasSpellingMetrics.editDistance(candidate, word) <= maxDistance
+            candidate != word && AtlasSpellingMetrics.editDistance(candidate, word, maxDistance: maxDistance) != nil
         }
     }
 
     func isStrongSplitWord(_ word: String) -> Bool {
         if word.count == 1 {
             return word == "a" || word == "i"
+        }
+        if word.count >= 3, !AtlasSplitWordPolicy.commonSplitWords.contains(word) {
+            return false
         }
         guard dictionaryWordSet.contains(word), let rank = rankByWord[word] else { return false }
         if word.count == 2 {
@@ -623,8 +672,7 @@ private final class AtlasQuickSplitLexicon {
         let candidates = ((targetLength - maxDistance)...(targetLength + maxDistance))
             .flatMap { commonWordsByLength[$0] ?? [] }
         for candidate in candidates {
-            let distance = AtlasSpellingMetrics.editDistance(raw, candidate)
-            guard distance <= maxDistance else { continue }
+            guard let distance = AtlasSpellingMetrics.editDistance(raw, candidate, maxDistance: maxDistance) else { continue }
             results.append((candidate, distance))
         }
 
@@ -639,6 +687,80 @@ private final class AtlasQuickSplitLexicon {
 
     func frequency(for word: String) -> Double {
         max(1, frequencyByWord[word] ?? 1)
+    }
+}
+
+final class LiveWordDecoder {
+    struct Snapshot: Equatable {
+        var rawWord: String
+        var leftContext: String
+        var generation: Int
+    }
+
+    private(set) var rawWord = ""
+    private var leftContext = ""
+    private var generation = 0
+    private var cachedDecision: AtlasAutocorrectDecision?
+
+    func append(_ text: String, leftContextBeforeInput: String) {
+        guard text.rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
+              text.rangeOfCharacter(from: .letters) != nil
+        else {
+            reset()
+            return
+        }
+
+        if rawWord.isEmpty {
+            leftContext = leftContextBeforeInput
+        }
+        rawWord.append(contentsOf: text)
+        generation += 1
+        cachedDecision = nil
+    }
+
+    func backspace() {
+        guard !rawWord.isEmpty else {
+            reset()
+            return
+        }
+        rawWord.removeLast()
+        generation += 1
+        cachedDecision = nil
+        if rawWord.isEmpty {
+            leftContext = ""
+        }
+    }
+
+    func reset() {
+        rawWord = ""
+        leftContext = ""
+        generation += 1
+        cachedDecision = nil
+    }
+
+    func snapshot() -> Snapshot? {
+        guard rawWord.count >= 3 else { return nil }
+        return Snapshot(rawWord: rawWord, leftContext: leftContext, generation: generation)
+    }
+
+    func storeDecision(_ decision: AtlasAutocorrectDecision?, for snapshot: Snapshot) {
+        guard snapshot.generation == generation,
+              snapshot.rawWord.localizedCaseInsensitiveCompare(rawWord) == .orderedSame
+        else {
+            return
+        }
+        cachedDecision = decision
+    }
+
+    func commitDecision(minimumConfidence: Double = 0.55) -> AtlasAutocorrectDecision? {
+        guard let cachedDecision,
+              cachedDecision.confidence >= minimumConfidence,
+              cachedDecision.original.localizedCaseInsensitiveCompare(rawWord) == .orderedSame,
+              cachedDecision.replacement.localizedCaseInsensitiveCompare(rawWord) != .orderedSame
+        else {
+            return nil
+        }
+        return cachedDecision
     }
 }
 
@@ -866,14 +988,36 @@ enum AtlasAutocorrectDataLoader {
 }
 
 private final class AtlasAutocorrectLexicon {
-    let words: [String]
-    let candidateWords: [String]
-    private let wordSet: Set<String>
-    private let candidateWordsByLength: [Int: [String]]
-    private let frequencies: [String: Double]
+    private struct RuntimeStorage {
+        var wordSet: Set<String>
+        var completionWords: [String]
+        var deleteIndexByKey: [String: [String]]
+        var frequencies: [String: Double]
+        var diagnosticsDescription: String
+    }
+
+    private enum Storage {
+        case compiled(AtlasCompiledAutocorrectLexicon)
+        case runtime(RuntimeStorage)
+    }
+
+    private let storage: Storage
     let diagnosticsDescription: String
 
     init(bundle: Bundle = .main) {
+        do {
+            let compiled = try AtlasCompiledAutocorrectLexicon(bundle: bundle)
+            storage = .compiled(compiled)
+            diagnosticsDescription = compiled.diagnosticsDescription
+            return
+        } catch {
+            let runtime = Self.makeRuntimeStorage(bundle: bundle)
+            storage = .runtime(runtime)
+            diagnosticsDescription = "runtimeFallback=true reason=\(error); \(runtime.diagnosticsDescription)"
+        }
+    }
+
+    private static func makeRuntimeStorage(bundle: Bundle) -> RuntimeStorage {
         var mergedFrequencies = Self.seedFrequencies
         let loadedFrequencyTable = AtlasAutocorrectDataLoader.loadFrequencyTable(named: "frequency_table", bundle: bundle)
         let frequencyTableStatus: String
@@ -905,7 +1049,9 @@ private final class AtlasAutocorrectLexicon {
 
         var importedCandidateWords = AtlasAutocorrectDataLoader.loadWordList(named: "english_bktree_words", bundle: bundle) ?? []
         let importedCandidateCount = importedCandidateWords.count
-        importedCandidateWords.append(contentsOf: mergedFrequencies.keys)
+        importedCandidateWords.append(contentsOf: Self.seedFrequencies.keys)
+        importedCandidateWords.append(contentsOf: Self.additionalCommonWords)
+        importedCandidateWords.append(contentsOf: EngramNormalizer.commonWordsForAutocorrect)
         let candidateWords = Self.orderedUnique(importedCandidateWords.filter(Self.isUsableCandidate))
             .filter { dictionaryWordSet.contains($0) || mergedFrequencies[$0] != nil }
 
@@ -915,38 +1061,77 @@ private final class AtlasAutocorrectLexicon {
             mergedFrequencies[word, default: rankScore] = max(mergedFrequencies[word] ?? 0, rankScore)
         }
 
-        frequencies = mergedFrequencies
-        words = dictionaryWords
-        wordSet = dictionaryWordSet
-        self.candidateWords = candidateWords
-        candidateWordsByLength = Dictionary(grouping: candidateWords, by: \.count)
-        diagnosticsDescription = "dictionary=english_words.bin entries=\(importedDictionaryCount) usable=\(dictionaryWords.count); candidates=english_bktree_words.bin entries=\(importedCandidateCount) usable=\(candidateWords.count); frequency_table.bin \(frequencyTableStatus)"
+        var deleteIndex: [String: [String]] = [:]
+        for word in candidateWords {
+            for key in Self.deletionKeys(for: word, maxDeletes: 1) {
+                deleteIndex[key, default: []].append(word)
+            }
+        }
+        return RuntimeStorage(
+            wordSet: dictionaryWordSet,
+            completionWords: candidateWords,
+            deleteIndexByKey: deleteIndex,
+            frequencies: mergedFrequencies,
+            diagnosticsDescription: "dictionary=english_words.bin entries=\(importedDictionaryCount) usable=\(dictionaryWords.count); candidates=english_bktree_words.bin entries=\(importedCandidateCount) usable=\(candidateWords.count); frequency_table.bin \(frequencyTableStatus)"
+        )
     }
 
     func contains(_ word: String) -> Bool {
-        wordSet.contains(word)
+        switch storage {
+        case .compiled(let compiled):
+            compiled.contains(word)
+        case .runtime(let runtime):
+            runtime.wordSet.contains(word)
+        }
     }
 
     func frequency(for word: String) -> Double {
-        max(1, frequencies[word] ?? 8)
+        switch storage {
+        case .compiled(let compiled):
+            compiled.frequency(for: word)
+        case .runtime(let runtime):
+            max(1, runtime.frequencies[word] ?? 8)
+        }
+    }
+
+    func completions(for prefix: String, limit: Int) -> [String] {
+        let normalized = AtlasAutocorrectToken(rawValue: prefix).normalized
+        guard normalized.count >= 1 else { return [] }
+        switch storage {
+        case .compiled(let compiled):
+            return compiled.completions(forNormalizedPrefix: normalized, limit: limit)
+        case .runtime(let runtime):
+            return Array(
+                runtime.completionWords
+                    .lazy
+                    .filter { $0.hasPrefix(normalized) && $0 != normalized }
+                    .prefix(limit)
+            )
+        }
     }
 
     func correctionCandidates(for word: String, maxDistance: Int, limit: Int) -> [String] {
-        let targetLength = word.count
+        if case .compiled(let compiled) = storage {
+            return compiled.correctionCandidates(forNormalizedWord: word, maxDistance: maxDistance, limit: limit)
+        }
+
+        guard case .runtime(let runtime) = storage else { return [] }
         var results: [(word: String, distance: Int)] = []
         results.reserveCapacity(limit)
+        var seen = Set<String>()
 
-        let candidatesForLength = ((targetLength - maxDistance)...(targetLength + maxDistance))
-            .flatMap { candidateWordsByLength[$0] ?? [] }
-        for candidate in candidatesForLength {
-            let distance = AtlasSpellingMetrics.editDistance(candidate, word)
-            guard distance <= maxDistance else { continue }
-            results.append((candidate, distance))
-            if results.count >= limit * 4 {
-                break
+        for key in Self.deletionKeys(for: word, maxDeletes: min(maxDistance, 1)) {
+            for candidate in runtime.deleteIndexByKey[key] ?? [] where seen.insert(candidate).inserted {
+                guard candidate != word, abs(candidate.count - word.count) <= maxDistance else { continue }
+                guard let distance = AtlasSpellingMetrics.editDistance(candidate, word, maxDistance: maxDistance) else { continue }
+                results.append((candidate, distance))
             }
         }
 
+        return sortedCandidates(results, limit: limit)
+    }
+
+    private func sortedCandidates(_ results: [(word: String, distance: Int)], limit: Int) -> [String] {
         return results
             .sorted { lhs, rhs in
                 if lhs.distance != rhs.distance { return lhs.distance < rhs.distance }
@@ -954,6 +1139,35 @@ private final class AtlasAutocorrectLexicon {
             }
             .prefix(limit)
             .map(\.word)
+    }
+
+    private static func deletionKeys(for word: String, maxDeletes: Int) -> Set<String> {
+        let characters = Array(word)
+        guard !characters.isEmpty else { return [] }
+
+        var keys: Set<String> = [word]
+        var frontier: Set<String> = [word]
+        guard maxDeletes > 0 else { return keys }
+
+        for _ in 0..<maxDeletes {
+            var next: Set<String> = []
+            for value in frontier {
+                let valueCharacters = Array(value)
+                guard valueCharacters.count > 1 else { continue }
+                for index in valueCharacters.indices {
+                    var deleted = valueCharacters
+                    deleted.remove(at: index)
+                    let key = String(deleted)
+                    if keys.insert(key).inserted {
+                        next.insert(key)
+                    }
+                }
+            }
+            frontier = next
+            if frontier.isEmpty { break }
+        }
+
+        return keys
     }
 
     nonisolated private static func isUsableWord(_ word: String) -> Bool {
@@ -1032,6 +1246,20 @@ private final class AtlasAutocorrectLexicon {
         "until", "wait", "walk", "watch", "water", "week", "while", "word", "world",
         "write", "wrong", "yesterday"
     ]
+}
+
+private enum AtlasSplitWordPolicy {
+    static let commonSplitWords: Set<String> = EngramNormalizer.commonWordsForAutocorrect.union([
+        "accept", "account", "actually", "address", "answer", "around", "away",
+        "baby", "believe", "birthday", "business", "change", "class", "company",
+        "complete", "correct", "different", "enough", "every", "family", "friend",
+        "happy", "happen", "important", "inside", "learn", "leave", "maybe",
+        "minute", "money", "morning", "night", "person", "phone", "problem",
+        "project", "question", "ready", "reason", "remember", "reply", "school",
+        "someone", "something", "sorry", "speak", "story", "study", "system",
+        "thank", "thanks", "together", "tomorrow", "understand", "until",
+        "wait", "water", "while", "world", "write", "wrong", "yesterday"
+    ])
 }
 
 private final class AtlasBKTreeUnused {

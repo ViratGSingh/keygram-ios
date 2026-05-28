@@ -113,6 +113,7 @@ final class KeyboardViewController: UIInputViewController {
     private var keyboardView: KeyboardSurfaceView?
     private var keyboardViewConstraints: [NSLayoutConstraint] = []
     private var inputHeightConstraint: NSLayoutConstraint?
+    private var currentKeyboardHeight = LayoutMetric.keyboardHeight
     private let inferenceQueue = DispatchQueue(label: "com.wooshir.keygram.inference", qos: .userInitiated)
     private let engramQueue = DispatchQueue(label: "com.wooshir.keygram.engram", qos: .utility)
     private let autocorrectQueue = DispatchQueue(label: "com.wooshir.keygram.autocorrect", qos: .userInitiated)
@@ -129,6 +130,9 @@ final class KeyboardViewController: UIInputViewController {
     private var displayedSuggestions: [AtlasSuggestion] = []
     private var autocorrectEngine: AtlasAutocorrectEngine?
     private var isAutocorrectLoading = false
+    private let liveWordDecoder = LiveWordDecoder()
+    private var isLiveAutocorrectRunning = false
+    private var needsLiveAutocorrectRefresh = false
     private var isEngramMigrationRunning = false
     private var touchDecoder: KeygramDecoder?
     private var touchModelStore: TouchModelStore?
@@ -175,6 +179,7 @@ final class KeyboardViewController: UIInputViewController {
 
     private enum AutocorrectTiming {
         static let slowDecisionLogThreshold: CFTimeInterval = 0.05
+        static let maximumApplyDelay: CFTimeInterval = 0.35
     }
 
     required init?(coder: NSCoder) {
@@ -307,7 +312,7 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     override func updateViewConstraints() {
-        inputHeightConstraint?.constant = LayoutMetric.keyboardHeight
+        inputHeightConstraint?.constant = currentKeyboardHeight
         super.updateViewConstraints()
     }
 
@@ -317,6 +322,8 @@ final class KeyboardViewController: UIInputViewController {
         pendingEngineWarmup?.cancel()
         pendingEngineWarmup = nil
         needsSuggestionRefreshAfterInference = false
+        liveWordDecoder.reset()
+        needsLiveAutocorrectRefresh = false
         logStartup("textWillChange")
     }
 
@@ -335,6 +342,9 @@ final class KeyboardViewController: UIInputViewController {
     private func installFreshKeyboardSurface(reason: String) {
         let installStart = CFAbsoluteTimeGetCurrent()
         teardownKeyboardSurface(reason: "\(reason) preinstall")
+        currentKeyboardHeight = LayoutMetric.keyboardHeight
+        inputHeightConstraint?.constant = currentKeyboardHeight
+        preferredContentSize = CGSize(width: 0, height: currentKeyboardHeight)
 
         UIView.performWithoutAnimation {
             let surfaceInitStart = CFAbsoluteTimeGetCurrent()
@@ -388,11 +398,13 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     private var engineStatusName: String {
-        guard let engine else { return "LOADING" }
+        guard shouldUseInferenceSuggestions() else { return activeSession.name }
+        guard let engine else { return "AUTOCORRECT" }
         return engine.isModelBundleAvailable ? activeSession.name : "NO MODEL"
     }
 
     private func loadEngineIfNeeded() {
+        guard shouldUseInferenceSuggestions() else { return }
         guard engine == nil, !isEngineLoading else { return }
         isEngineLoading = true
         logStartup("requesting shared lazy session/model load")
@@ -418,6 +430,8 @@ final class KeyboardViewController: UIInputViewController {
             self.logStartup("attached shared autocorrect index")
             self.logStartup("autocorrect diagnostics \(engine.diagnosticsDescription)")
             self.migrateEngramLearningIfNeeded(using: engine)
+            self.refreshLiveAutocorrect()
+            self.scheduleSuggestionRefresh(after: 0)
         }
     }
 
@@ -518,7 +532,7 @@ final class KeyboardViewController: UIInputViewController {
 
     private func isTouchModelLayoutGeometryReady(_ keyboardView: KeyboardSurfaceView) -> Bool {
         let bounds = keyboardView.bounds
-        let targetHeight = KeyboardSurfaceView.preferredKeyboardHeight
+        let targetHeight = currentKeyboardHeight
         return bounds.width > 0
             && bounds.height > 0
             && abs(bounds.height - targetHeight) <= 8
@@ -657,12 +671,14 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     private func scheduleEngineLoadAfterTypingIdle(after delay: TimeInterval = 0.85) {
+        guard shouldUseInferenceSuggestions() else { return }
         guard engine == nil, !isEngineLoading else { return }
         pendingEngineWarmup?.cancel()
 
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.pendingEngineWarmup = nil
+            guard self.shouldUseInferenceSuggestions() else { return }
             self.loadEngineIfNeeded()
         }
         pendingEngineWarmup = work
@@ -680,9 +696,12 @@ final class KeyboardViewController: UIInputViewController {
         acceptPendingAutocorrectionIfNeeded()
         let pathStartedAt = pathStartedAt ?? CACurrentMediaTime()
         let inserted = isShifted || isCapsLocked ? text.uppercased() : text
+        let contextBeforeCharacter = contextBeforeInput()
         insertTextIntoDocument(inserted, label: "key \(loggableInput(inserted))", touchStartedAt: touchStartedAt, touchEndedAt: touchEndedAt, pathStartedAt: pathStartedAt)
         currentDraftText.append(contentsOf: inserted)
+        liveWordDecoder.append(inserted, leftContextBeforeInput: contextBeforeCharacter)
         consumeOneShotShiftIfNeeded()
+        refreshLiveAutocorrect()
         scheduleSuggestionRefresh()
     }
 
@@ -834,6 +853,10 @@ final class KeyboardViewController: UIInputViewController {
         userDefaultsEnabled(AtlasConfiguration.personalizedAutocorrectEnabledKey, defaultValue: true)
     }
 
+    private func shouldUseInferenceSuggestions() -> Bool {
+        userDefaultsEnabled(AtlasConfiguration.inferenceSuggestionsEnabledKey, defaultValue: false)
+    }
+
     private func shouldUsePersonalizedTyping() -> Bool {
         userDefaultsEnabled(AtlasConfiguration.personalizedTypingEnabledKey, defaultValue: false)
     }
@@ -859,16 +882,17 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     private func refreshSuggestions() {
+        let context = contextBeforeInput()
+        let selectedWord = selectedCorrectionWord()
         guard let engine else {
-            if shouldGenerateSuggestions(context: contextBeforeInput(), selectedWord: selectedCorrectionWord()) {
+            if shouldUseInferenceSuggestions(),
+               shouldGenerateSuggestions(context: context, selectedWord: selectedWord) {
                 scheduleEngineLoadAfterTypingIdle()
             }
-            applySuggestions([])
+            applySuggestions(lightweightSuggestions(context: context, selectedWord: selectedWord))
             return
         }
 
-        let context = contextBeforeInput()
-        let selectedWord = selectedCorrectionWord()
         let rightContext = textDocumentProxy.documentContextAfterInput ?? ""
         let session = activeSession
         let request = SuggestionRequest(
@@ -984,6 +1008,21 @@ final class KeyboardViewController: UIInputViewController {
             || context.rangeOfCharacter(from: .decimalDigits) != nil
     }
 
+    private func lightweightSuggestions(context: String, selectedWord: String?) -> [AtlasSuggestion] {
+        guard selectedWord == nil,
+              let partial = PartialWordDetector.partialWord(in: context),
+              let autocorrectEngine
+        else {
+            return []
+        }
+        return autocorrectEngine.completions(
+            for: partial,
+            leftContext: leftContextBeforeLastWord(context: context, word: partial),
+            sessionEngram: activeSession.engram,
+            globalEngram: Engram()
+        )
+    }
+
     private func applySuggestions(_ suggestions: [AtlasSuggestion]) {
         guard suggestions != displayedSuggestions else { return }
         displayedSuggestions = suggestions
@@ -996,10 +1035,12 @@ final class KeyboardViewController: UIInputViewController {
     private func acceptSuggestion(_ suggestion: AtlasSuggestion, touchStartedAt: CFTimeInterval, touchEndedAt: CFTimeInterval) {
         if suggestion.kind == .undoAutocorrection {
             _ = undoLastAutocorrection(touchStartedAt: touchStartedAt, touchEndedAt: touchEndedAt)
+            liveWordDecoder.reset()
             return
         }
 
         acceptPendingAutocorrectionIfNeeded()
+        liveWordDecoder.reset()
         let pathStartedAt = CACurrentMediaTime()
         let context = contextBeforeInput()
         commitTouchWord(actualWord: suggestion.text)
@@ -1102,6 +1143,69 @@ final class KeyboardViewController: UIInputViewController {
         observeTypedWord(word, assessment: assessment)
     }
 
+    private func refreshLiveAutocorrect() {
+        guard !shouldSkipAutocorrectForCurrentField(),
+              let autocorrectEngine,
+              let snapshot = liveWordDecoder.snapshot()
+        else {
+            return
+        }
+
+        guard !isLiveAutocorrectRunning else {
+            needsLiveAutocorrectRefresh = true
+            return
+        }
+
+        isLiveAutocorrectRunning = true
+        let session = activeSession
+        let usePersonalizedAutocorrect = shouldUsePersonalizedAutocorrect()
+        let startedAt = CACurrentMediaTime()
+
+        autocorrectQueue.async { [weak self] in
+            let feedback = usePersonalizedAutocorrect
+                ? AutocorrectFeedbackStore.shared.snapshot()
+                : AutocorrectFeedbackSnapshot()
+            let decision = autocorrectEngine.correction(
+                for: snapshot.rawWord,
+                leftContext: snapshot.leftContext,
+                sessionEngram: session.engram,
+                globalEngram: Engram(),
+                feedback: feedback
+            )
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                let elapsed = CACurrentMediaTime() - startedAt
+                self.liveWordDecoder.storeDecision(decision, for: snapshot)
+                if let decision {
+                    self.logAutocorrect(
+                        String(
+                            format: "live candidate '%@' -> '%@' confidence=%.3f margin=%.3f elapsed=%.3fms",
+                            decision.original,
+                            decision.replacement,
+                            decision.confidence,
+                            decision.margin,
+                            elapsed * 1_000
+                        )
+                    )
+                } else {
+                    self.logAutocorrect(
+                        String(
+                            format: "live no candidate '%@' elapsed=%.3fms",
+                            snapshot.rawWord,
+                            elapsed * 1_000
+                        )
+                    )
+                }
+                self.isLiveAutocorrectRunning = false
+                if self.needsLiveAutocorrectRefresh {
+                    self.needsLiveAutocorrectRefresh = false
+                    self.refreshLiveAutocorrect()
+                }
+            }
+        }
+    }
+
     private func demoteMistypedWord(_ word: String) {
         guard shouldLearnNewWords() else { return }
         enqueueEngramUpdate { session in
@@ -1202,6 +1306,18 @@ final class KeyboardViewController: UIInputViewController {
                 }
                 guard let decision else {
                     self.logAutocorrect("no space correction for '\(typedWord)'")
+                    self.observeTypedWord(typedWord, assessment: autocorrectEngine.learningAssessment(for: typedWord))
+                    return
+                }
+                guard elapsed <= AutocorrectTiming.maximumApplyDelay else {
+                    self.logAutocorrect(
+                        String(
+                            format: "skipped late space correction '%@' -> '%@' elapsed=%.3fms",
+                            decision.original,
+                            decision.replacement,
+                            elapsed * 1_000
+                        )
+                    )
                     self.observeTypedWord(typedWord, assessment: autocorrectEngine.learningAssessment(for: typedWord))
                     return
                 }
@@ -1344,6 +1460,7 @@ final class KeyboardViewController: UIInputViewController {
         pendingSuggestionRefresh?.cancel()
         engine?.resetCurrentDraftMemory()
         currentDraftText.removeAll()
+        liveWordDecoder.reset()
         enqueueEngramUpdate { session in
             session.engram.learnMessage(draftText, sessionName: sessionName)
             session.glaState = glaState
@@ -1401,11 +1518,27 @@ extension KeyboardViewController: KeyboardSurfaceViewDelegate {
         case .space:
             let contextBeforeSpace = contextBeforeInput()
             let typedWord = lastTypedWordBeforeSpace()
+            let liveDecision = liveWordDecoder.commitDecision()
             insertTextIntoDocument(" ", label: "key space", touchStartedAt: touchStartedAt, touchEndedAt: touchEndedAt, pathStartedAt: pathStartedAt)
             currentDraftText.append(" ")
             observeTouchBoundary(" ", at: point, actualWord: nil)
             acceptPendingAutocorrectionIfNeeded()
-            if !scheduleAutocorrectAfterSpace(typedWord: typedWord, contextBeforeSpace: contextBeforeSpace, touchEndedAt: touchEndedAt),
+            var didApplyLiveDecision = false
+            if let liveDecision,
+               let typedWord,
+               liveDecision.original.localizedCaseInsensitiveCompare(typedWord) == .orderedSame {
+                let leftContext = leftContextBeforeLastWord(context: contextBeforeSpace, word: typedWord)
+                applyAutocorrectDecisionAfterSpace(
+                    liveDecision,
+                    contextKey: AtlasAutocorrectEngine.contextKey(from: leftContext),
+                    touchEndedAt: touchEndedAt,
+                    decisionElapsed: 0
+                )
+                didApplyLiveDecision = true
+            }
+            liveWordDecoder.reset()
+            if !didApplyLiveDecision,
+               !scheduleAutocorrectAfterSpace(typedWord: typedWord, contextBeforeSpace: contextBeforeSpace, touchEndedAt: touchEndedAt),
                let typedWord {
                 observeTypedWordUsingAutocorrectLexicon(typedWord)
             }
@@ -1415,12 +1548,17 @@ extension KeyboardViewController: KeyboardSurfaceViewDelegate {
             if !undoLastAutocorrection(touchStartedAt: touchStartedAt, touchEndedAt: touchEndedAt) {
                 deleteBackwardFromDocument(label: "key backspace", touchStartedAt: touchStartedAt, touchEndedAt: touchEndedAt, pathStartedAt: pathStartedAt)
                 deleteLastDraftCharacter()
+                liveWordDecoder.backspace()
+                refreshLiveAutocorrect()
                 scheduleSuggestionRefresh()
+            } else {
+                liveWordDecoder.reset()
             }
         case .returnKey:
             observeTouchBoundary("\n", at: point, actualWord: nil)
             acceptPendingAutocorrectionIfNeeded()
             insertTextIntoDocument("\n", label: "key return", touchStartedAt: touchStartedAt, touchEndedAt: touchEndedAt, pathStartedAt: pathStartedAt)
+            liveWordDecoder.reset()
             endCurrentDraft()
         case .shift:
             handleShiftTap(at: touchEndedAt)
@@ -1433,14 +1571,25 @@ extension KeyboardViewController: KeyboardSurfaceViewDelegate {
         acceptSuggestion(suggestion, touchStartedAt: touchStartedAt, touchEndedAt: touchEndedAt)
     }
 
+    func keyboardSurfaceView(_ view: KeyboardSurfaceView, preferredHeightDidChange height: CGFloat) {
+        currentKeyboardHeight = height
+        inputHeightConstraint?.constant = height
+        preferredContentSize = CGSize(width: 0, height: height)
+        view.setNeedsLayout()
+        self.view.setNeedsUpdateConstraints()
+    }
+
     func keyboardSurfaceViewDidLongPressBackspace(_ view: KeyboardSurfaceView) {
         touchDecoder?.handleBackspace()
         textDocumentProxy.deleteBackward()
         deleteLastDraftCharacter()
+        liveWordDecoder.backspace()
+        refreshLiveAutocorrect()
         refreshSuggestions()
     }
 
     func keyboardSurfaceViewDidLongPressSession(_ view: KeyboardSurfaceView) {
+        liveWordDecoder.reset()
         endCurrentDraft()
     }
 

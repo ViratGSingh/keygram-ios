@@ -46,16 +46,11 @@ final class TouchModelStore {
     /// Save asynchronously off the main thread. Safe to call frequently
     /// (e.g. once per committed word).
     func save(_ model: TouchModel) {
-        let data: Data
-        do {
-            data = try JSONEncoder().encode(model)
-        } catch {
-            NSLog("Keygram: failed to encode touch model: \(error)")
-            return
-        }
+        let snapshot = model.codableSnapshot()
 
         queue.async { [fileURL] in
             do {
+                let data = try JSONEncoder().encode(snapshot)
                 // Atomic write: writes to a temp file, then renames into place.
                 // This means we never end up with a half-written corrupted file
                 // even if the keyboard extension is killed mid-save.

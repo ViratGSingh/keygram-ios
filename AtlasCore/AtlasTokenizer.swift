@@ -172,6 +172,49 @@ enum AtlasSpellingMetrics {
         return distance[a.count][b.count]
     }
 
+    static func editDistance(_ lhs: String, _ rhs: String, maxDistance: Int) -> Int? {
+        let a = Array(lhs)
+        let b = Array(rhs)
+        guard abs(a.count - b.count) <= maxDistance else { return nil }
+        guard !a.isEmpty else { return b.count <= maxDistance ? b.count : nil }
+        guard !b.isEmpty else { return a.count <= maxDistance ? a.count : nil }
+
+        var previousPrevious = Array(repeating: 0, count: b.count + 1)
+        var previous = Array(0...b.count)
+        var current = Array(repeating: 0, count: b.count + 1)
+
+        for i in 1...a.count {
+            current[0] = i
+            var rowMinimum = current[0]
+
+            for j in 1...b.count {
+                let cost = a[i - 1] == b[j - 1] ? 0 : 1
+                var value = min(
+                    previous[j] + 1,
+                    current[j - 1] + 1,
+                    previous[j - 1] + cost
+                )
+
+                if i > 1,
+                   j > 1,
+                   a[i - 1] == b[j - 2],
+                   a[i - 2] == b[j - 1] {
+                    value = min(value, previousPrevious[j - 2] + 1)
+                }
+
+                current[j] = value
+                rowMinimum = min(rowMinimum, value)
+            }
+
+            guard rowMinimum <= maxDistance else { return nil }
+            previousPrevious = previous
+            previous = current
+        }
+
+        let distance = previous[b.count]
+        return distance <= maxDistance ? distance : nil
+    }
+
     static func commonPrefixLength(_ lhs: String, _ rhs: String) -> Int {
         var count = 0
         for (left, right) in zip(lhs, rhs) {

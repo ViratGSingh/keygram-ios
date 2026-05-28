@@ -2,7 +2,7 @@ import Foundation
 import CoreGraphics
 
 /// One key's position and dimensions in the keyboard layout.
-struct KeyLayout: Codable {
+nonisolated struct KeyLayout: Codable, Sendable {
     let id: String              // e.g. "h", "shift", "space"
     let centerX: Double         // points, keyboard-local
     let centerY: Double
@@ -15,6 +15,11 @@ struct KeyLayout: Codable {
 enum DeviceOrientation: String, Codable {
     case portrait
     case landscape
+}
+
+nonisolated struct TouchModelSnapshot: Codable, Sendable {
+    let gaussians: [DeviceOrientation: [String: KeyGaussian]]
+    let layouts: [DeviceOrientation: [String: KeyLayout]]
 }
 
 /// The touch model — the heart of the spatial decoder.
@@ -175,6 +180,10 @@ final class TouchModel: Codable {
             }
             gaussians[orientation] = resetKeys
         }
+    }
+
+    func codableSnapshot() -> TouchModelSnapshot {
+        TouchModelSnapshot(gaussians: gaussians, layouts: layouts)
     }
 
     private static let requiredLetterIDs = Set("abcdefghijklmnopqrstuvwxyz".map(String.init))
