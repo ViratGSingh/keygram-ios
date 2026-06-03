@@ -117,6 +117,7 @@ final class KeyboardViewController: UIInputViewController {
     private let inferenceQueue = DispatchQueue(label: "com.wooshir.keygram.inference", qos: .userInitiated)
     private let engramQueue = DispatchQueue(label: "com.wooshir.keygram.engram", qos: .utility)
     private let autocorrectQueue = DispatchQueue(label: "com.wooshir.keygram.autocorrect", qos: .userInitiated)
+    private let aiRewriteService = AIRewriteService()
     private var currentDraftText = ""
     private var suggestionGeneration = 0
     private var autocorrectGeneration = 0
@@ -141,6 +142,9 @@ final class KeyboardViewController: UIInputViewController {
     private var undoPillExpiresAt: Date?
     private var pendingAutocorrection: PendingAutocorrection?
     private var isEngineLoading = false
+    private var aiRewriteGeneration = 0
+    private var isAIRewriteRunning = false
+    private var pendingRewriteUndo: RewriteUndo?
     private var hasEnteredPresentation = false
     private let startupLogStart = CFAbsoluteTimeGetCurrent()
     private static let disabledLayerActions: [String: CAAction] = [
@@ -175,6 +179,17 @@ final class KeyboardViewController: UIInputViewController {
         var original: String
         var correction: String
         var contextKey: String
+    }
+
+    private struct RewriteTarget {
+        var promptText: String
+        var textToReplace: String
+        var usesSelection: Bool
+    }
+
+    private struct RewriteUndo {
+        var original: String
+        var replacement: String
     }
 
     private enum AutocorrectTiming {
@@ -344,6 +359,7 @@ final class KeyboardViewController: UIInputViewController {
         super.textDidChange(textInput)
         logPendingInputDidChange()
         keyboardView?.setReturnKeyType(textDocumentProxy.returnKeyType ?? .default)
+        keyboardView?.setAIRewriteEnabled(shouldUseAIRewrite())
         scheduleSuggestionRefresh()
     }
 
@@ -386,6 +402,7 @@ final class KeyboardViewController: UIInputViewController {
             surface.setReturnKeyType(textDocumentProxy.returnKeyType ?? .default)
             surface.setShiftState(isShifted || isCapsLocked, capsLocked: isCapsLocked)
             surface.setSuggestions(displayedSuggestions)
+            surface.setAIRewriteEnabled(shouldUseAIRewrite())
             logStartup(String(format: "keyboard surface configure %.3fs", CFAbsoluteTimeGetCurrent() - configureStart))
         }
         logStartup(String(format: "installed fresh keyboard surface (%@) total %.3fs", reason, CFAbsoluteTimeGetCurrent() - installStart))
@@ -706,6 +723,7 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     private func insert(_ text: String, touchStartedAt: CFTimeInterval, touchEndedAt: CFTimeInterval, pathStartedAt: CFTimeInterval? = nil) {
+        pendingRewriteUndo = nil
         acceptPendingAutocorrectionIfNeeded()
         let pathStartedAt = pathStartedAt ?? CACurrentMediaTime()
         let inserted = isShifted || isCapsLocked ? text.uppercased() : text
@@ -868,6 +886,19 @@ final class KeyboardViewController: UIInputViewController {
 
     private func shouldUseInferenceSuggestions() -> Bool {
         userDefaultsEnabled(AtlasConfiguration.inferenceSuggestionsEnabledKey, defaultValue: true)
+    }
+
+    private func shouldUseAIRewrite() -> Bool {
+        userDefaultsEnabled(AtlasConfiguration.aiRewriteEnabledKey, defaultValue: true)
+    }
+
+    private func hasAcceptedAIRewriteDisclosure() -> Bool {
+        userDefaultsEnabled(AtlasConfiguration.aiRewriteDisclosureAcceptedKey, defaultValue: false)
+    }
+
+    private func setAcceptedAIRewriteDisclosure() {
+        let defaults = UserDefaults(suiteName: AtlasConfiguration.appGroupIdentifier) ?? .standard
+        defaults.set(true, forKey: AtlasConfiguration.aiRewriteDisclosureAcceptedKey)
     }
 
     private func shouldUsePersonalizedTyping() -> Bool {
@@ -1083,6 +1114,7 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     private func acceptSuggestion(_ suggestion: AtlasSuggestion, touchStartedAt: CFTimeInterval, touchEndedAt: CFTimeInterval) {
+        pendingRewriteUndo = nil
         if suggestion.kind == .undoAutocorrection {
             _ = undoLastAutocorrection(touchStartedAt: touchStartedAt, touchEndedAt: touchEndedAt)
             liveWordDecoder.reset()
@@ -1124,6 +1156,146 @@ final class KeyboardViewController: UIInputViewController {
 
     private func shouldReplacePartial(_ partial: String, with suggestion: String, suggestionKind: AtlasSuggestionKind) -> Bool {
         suggestionKind == .completion || suggestion.localizedCaseInsensitiveCompare(partial) == .orderedSame || suggestion.lowercased().hasPrefix(partial.lowercased())
+    }
+
+    private func openAIRewriteMode() {
+        guard shouldUseAIRewrite() else {
+            keyboardView?.setAIRewriteEnabled(false)
+            return
+        }
+
+        guard hasAcceptedAIRewriteDisclosure() else {
+            keyboardView?.showAIRewriteDisclosure()
+            return
+        }
+
+        keyboardView?.showAIRewriteStyles()
+    }
+
+    private func submitAIRewrite(style: AIRewriteStyle) {
+        guard !isAIRewriteRunning else { return }
+        guard let target = currentRewriteTarget() else {
+            showTemporaryToolbarMessage("Nothing to rewrite")
+            return
+        }
+
+        isAIRewriteRunning = true
+        aiRewriteGeneration += 1
+        let generation = aiRewriteGeneration
+        keyboardView?.showAIRewriteStyles(loadingStyle: style)
+
+        aiRewriteService.rewrite(text: target.promptText, style: style) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self, generation == self.aiRewriteGeneration else { return }
+                self.isAIRewriteRunning = false
+
+                switch result {
+                case .success(let rewrite):
+                    self.applyAIRewrite(rewrite, target: target)
+                case .failure:
+                    self.showTemporaryToolbarMessage("Couldn't reach AI - check connection")
+                }
+            }
+        }
+    }
+
+    private func currentRewriteTarget() -> RewriteTarget? {
+        if let selected = textDocumentProxy.selectedText {
+            let promptText = selected.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !promptText.isEmpty {
+                return RewriteTarget(promptText: promptText, textToReplace: selected, usesSelection: true)
+            }
+        }
+
+        let context = contextBeforeInput()
+        guard let fallback = fallbackRewriteText(in: context) else { return nil }
+        let promptText = fallback.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !promptText.isEmpty else { return nil }
+        return RewriteTarget(promptText: promptText, textToReplace: fallback, usesSelection: false)
+    }
+
+    private func fallbackRewriteText(in context: String) -> String? {
+        guard !context.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+
+        let boundaryCharacters = CharacterSet.newlines.union(CharacterSet(charactersIn: ".?!"))
+        if let lastBoundary = context.rangeOfCharacter(from: boundaryCharacters, options: .backwards) {
+            let suffix = String(context[lastBoundary.upperBound...])
+            let candidate = suffix.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !candidate.isEmpty {
+                return suffix
+            }
+        }
+
+        let maxCharacters = 700
+        if context.count > maxCharacters {
+            return String(context.suffix(maxCharacters))
+        }
+        return context
+    }
+
+    private func applyAIRewrite(_ rewrite: String, target: RewriteTarget) {
+        let replacement = rewrite.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !replacement.isEmpty else {
+            showTemporaryToolbarMessage("Couldn't rewrite that")
+            return
+        }
+
+        acceptPendingAutocorrectionIfNeeded()
+        liveWordDecoder.reset()
+        pendingRewriteUndo = RewriteUndo(original: target.textToReplace, replacement: replacement)
+
+        if target.usesSelection {
+            textDocumentProxy.insertText(replacement)
+        } else {
+            for _ in target.textToReplace {
+                textDocumentProxy.deleteBackward()
+            }
+            textDocumentProxy.insertText(replacement)
+        }
+
+        replaceDraftSuffix(target.textToReplace, with: replacement)
+        keyboardView?.hideAIRewriteMode()
+        scheduleSuggestionRefresh(after: 0)
+    }
+
+    private func undoLastAIRewrite() -> Bool {
+        guard let undo = pendingRewriteUndo else { return false }
+        let context = contextBeforeInput()
+        guard context.hasSuffix(undo.replacement) else {
+            pendingRewriteUndo = nil
+            return false
+        }
+
+        pendingRewriteUndo = nil
+        for _ in undo.replacement {
+            textDocumentProxy.deleteBackward()
+        }
+        textDocumentProxy.insertText(undo.original)
+        replaceDraftSuffix(undo.replacement, with: undo.original)
+        keyboardView?.setSuggestions(displayedSuggestions)
+        scheduleSuggestionRefresh(after: 0)
+        return true
+    }
+
+    private func showTemporaryToolbarMessage(_ message: String) {
+        keyboardView?.showToolbarMessage(message)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
+            self?.keyboardView?.hideAIRewriteMode()
+        }
+    }
+
+    private func pasteClipboardText() {
+        guard let pasted = UIPasteboard.general.string, !pasted.isEmpty else {
+            showTemporaryToolbarMessage("Clipboard is empty")
+            return
+        }
+
+        pendingRewriteUndo = nil
+        acceptPendingAutocorrectionIfNeeded()
+        liveWordDecoder.reset()
+        textDocumentProxy.insertText(pasted)
+        currentDraftText.append(contentsOf: pasted)
+        scheduleSuggestionRefresh(after: 0)
     }
 
     private func selectedCorrectionWord() -> String? {
@@ -1567,6 +1739,7 @@ extension KeyboardViewController: KeyboardSurfaceViewDelegate {
             let resolvedValue = resolvedTouchCharacter(for: value, at: point)
             insert(resolvedValue, touchStartedAt: touchStartedAt, touchEndedAt: touchEndedAt, pathStartedAt: pathStartedAt)
         case .space:
+            pendingRewriteUndo = nil
             let contextBeforeSpace = contextBeforeInput()
             let typedWord = lastTypedWordBeforeSpace()
             let liveDecision = liveWordDecoder.commitDecision()
@@ -1596,7 +1769,9 @@ extension KeyboardViewController: KeyboardSurfaceViewDelegate {
             scheduleSuggestionRefresh()
         case .backspace:
             touchDecoder?.handleBackspace()
-            if !undoLastAutocorrection(touchStartedAt: touchStartedAt, touchEndedAt: touchEndedAt) {
+            if undoLastAIRewrite() {
+                liveWordDecoder.reset()
+            } else if !undoLastAutocorrection(touchStartedAt: touchStartedAt, touchEndedAt: touchEndedAt) {
                 deleteBackwardFromDocument(label: "key backspace", touchStartedAt: touchStartedAt, touchEndedAt: touchEndedAt, pathStartedAt: pathStartedAt)
                 deleteLastDraftCharacter()
                 liveWordDecoder.backspace()
@@ -1606,6 +1781,7 @@ extension KeyboardViewController: KeyboardSurfaceViewDelegate {
                 liveWordDecoder.reset()
             }
         case .returnKey:
+            pendingRewriteUndo = nil
             observeTouchBoundary("\n", at: point, actualWord: nil)
             acceptPendingAutocorrectionIfNeeded()
             insertTextIntoDocument("\n", label: "key return", touchStartedAt: touchStartedAt, touchEndedAt: touchEndedAt, pathStartedAt: pathStartedAt)
@@ -1620,6 +1796,28 @@ extension KeyboardViewController: KeyboardSurfaceViewDelegate {
 
     func keyboardSurfaceView(_ view: KeyboardSurfaceView, didAccept suggestion: AtlasSuggestion, touchStartedAt: CFTimeInterval, touchEndedAt: CFTimeInterval) {
         acceptSuggestion(suggestion, touchStartedAt: touchStartedAt, touchEndedAt: touchEndedAt)
+    }
+
+    func keyboardSurfaceViewDidTapClipboard(_ view: KeyboardSurfaceView) {
+        pasteClipboardText()
+    }
+
+    func keyboardSurfaceViewDidTapAIRewrite(_ view: KeyboardSurfaceView) {
+        openAIRewriteMode()
+    }
+
+    func keyboardSurfaceViewDidAcceptAIRewriteDisclosure(_ view: KeyboardSurfaceView) {
+        setAcceptedAIRewriteDisclosure()
+        keyboardView?.showAIRewriteStyles()
+    }
+
+    func keyboardSurfaceView(_ view: KeyboardSurfaceView, didSelectAIRewriteStyle style: AIRewriteStyle) {
+        submitAIRewrite(style: style)
+    }
+
+    func keyboardSurfaceViewDidCancelAIRewrite(_ view: KeyboardSurfaceView) {
+        aiRewriteGeneration += 1
+        isAIRewriteRunning = false
     }
 
     func keyboardSurfaceView(_ view: KeyboardSurfaceView, preferredHeightDidChange height: CGFloat) {

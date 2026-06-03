@@ -16,6 +16,10 @@ struct ContentView: View {
         store: UserDefaults(suiteName: AtlasConfiguration.appGroupIdentifier)
     ) private var autocorrectEnabled = true
     @AppStorage(
+        AtlasConfiguration.aiRewriteEnabledKey,
+        store: UserDefaults(suiteName: AtlasConfiguration.appGroupIdentifier)
+    ) private var aiRewriteEnabled = true
+    @AppStorage(
         AtlasConfiguration.personalizedAutocorrectEnabledKey,
         store: UserDefaults(suiteName: AtlasConfiguration.appGroupIdentifier)
     ) private var personalizedAutocorrectEnabled = true
@@ -47,6 +51,7 @@ struct ContentView: View {
                     KeyboardSettingsView(
                         hapticsEnabled: $hapticsEnabled,
                         autocorrectEnabled: $autocorrectEnabled,
+                        aiRewriteEnabled: $aiRewriteEnabled,
                         personalizedAutocorrectEnabled: $personalizedAutocorrectEnabled,
                         learnNewWordsEnabled: $learnNewWordsEnabled,
                         darkKeyboardEnabled: $darkKeyboardEnabled
@@ -495,6 +500,7 @@ private struct KeyboardSetupView: View {
 private struct KeyboardSettingsView: View {
     @Binding var hapticsEnabled: Bool
     @Binding var autocorrectEnabled: Bool
+    @Binding var aiRewriteEnabled: Bool
     @Binding var personalizedAutocorrectEnabled: Bool
     @Binding var learnNewWordsEnabled: Bool
     @Binding var darkKeyboardEnabled: Bool
@@ -504,6 +510,7 @@ private struct KeyboardSettingsView: View {
             Section("Keyboard") {
                 Toggle("Haptics", isOn: $hapticsEnabled)
                 Toggle("Autocorrect", isOn: $autocorrectEnabled)
+                Toggle("AI Rewrite", isOn: $aiRewriteEnabled)
                 Toggle("Personalized autocorrect", isOn: $personalizedAutocorrectEnabled)
                 Toggle("Learn new words", isOn: $learnNewWordsEnabled)
                 Toggle("Dark keyboard", isOn: $darkKeyboardEnabled)
@@ -511,6 +518,12 @@ private struct KeyboardSettingsView: View {
 
             Section {
                 Text("Personalized autocorrect learns from corrections you keep and corrections you undo. Everything stays on this device.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("AI Rewrite Privacy") {
+                Text("AI Rewrite sends only the selected text or current message you submit for rewriting to OpenRouter. Normal typing stays on this device.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }

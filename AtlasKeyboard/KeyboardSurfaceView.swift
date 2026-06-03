@@ -8,6 +8,11 @@ protocol KeyboardSurfaceViewDelegate: AnyObject {
     func keyboardSurfaceViewDidLongPressSession(_ view: KeyboardSurfaceView)
     func keyboardSurfaceViewDidRequestDismissKeyboard(_ view: KeyboardSurfaceView)
     func keyboardSurfaceView(_ view: KeyboardSurfaceView, didSetHapticsEnabled enabled: Bool)
+    func keyboardSurfaceViewDidTapClipboard(_ view: KeyboardSurfaceView)
+    func keyboardSurfaceViewDidTapAIRewrite(_ view: KeyboardSurfaceView)
+    func keyboardSurfaceViewDidAcceptAIRewriteDisclosure(_ view: KeyboardSurfaceView)
+    func keyboardSurfaceView(_ view: KeyboardSurfaceView, didSelectAIRewriteStyle style: AIRewriteStyle)
+    func keyboardSurfaceViewDidCancelAIRewrite(_ view: KeyboardSurfaceView)
 }
 
 enum KeyboardKey: Equatable {
@@ -49,7 +54,8 @@ final class KeyboardSurfaceView: UIView {
         static let rowHeight: CGFloat = 52
         // 1 toolbar + 4 key rows + a little vertical slack.
         static let keyboardContentHeight: CGFloat = toolbarHeight + rowHeight * 4 + 8
-        static let emojiContentHeight: CGFloat = 330
+        // Normal emoji mode stays the same height as the regular keyboard.
+        static let emojiContentHeight: CGFloat = keyboardContentHeight
         static let emojiSearchContentHeight: CGFloat = 470
         static let buttonHorizontalInset: CGFloat = 3
         static let buttonVerticalInset: CGFloat = 4
@@ -76,6 +82,7 @@ final class KeyboardSurfaceView: UIView {
     private let rootStack = UIStackView()
     private let toolbarSlot = UIView()
     private let suggestionStack = UIStackView()
+    private let rewriteStack = UIStackView()
     private let collapsedToolbar = UIStackView()
     private let keyStack = UIStackView()
     private let menuOverlay = UIView()
@@ -88,12 +95,19 @@ final class KeyboardSurfaceView: UIView {
     private var personaPicker: UIScrollView!
     private var personaScrollStack: UIStackView?
     private var toolbarToggleButton: UIButton!
+    private var clipboardButton: UIButton!
+    private var aiRewriteButton: UIButton!
+    private var rewriteStyleButtons: [AIRewriteStyle: UIButton] = [:]
+    private var rewriteCancelButton: UIButton?
+    private var rewriteDisclosureContinueButton: UIButton?
+    private var rewriteDisclosureCancelButton: UIButton?
     private var hapticsToggleButton: UIButton?
     private var keyPreviewView: UIView?
     private var suggestionSeparatorLayers: [CALayer] = []
     private var touchStartTimes: [ObjectIdentifier: CFTimeInterval] = [:]
     private var isPersonaPickerOpen = false
     private var isMenuToggled = false
+    private var isRewriteModeOpen = false
     private var personas: [AtlasSession] = []
     private var activePersonaName = AtlasSession.defaultName
     private var backspaceTimer: Timer?
@@ -220,6 +234,7 @@ final class KeyboardSurfaceView: UIView {
         isPersonaPickerOpen = false
         personaPicker?.alpha = 0
         personaPicker?.isHidden = true
+        hideAIRewriteMode(animated: false)
         setMenuToggled(false, animated: false)
     }
 
@@ -245,6 +260,33 @@ final class KeyboardSurfaceView: UIView {
             }
         }
         updateSuggestionSeparators()
+    }
+
+    func setAIRewriteEnabled(_ isEnabled: Bool) {
+        aiRewriteButton?.isHidden = !isEnabled
+        aiRewriteButton?.isEnabled = isEnabled
+        if !isEnabled {
+            hideAIRewriteMode(animated: false)
+        }
+    }
+
+    func showAIRewriteStyles(loadingStyle: AIRewriteStyle? = nil) {
+        rebuildRewriteStyleToolbar(loadingStyle: loadingStyle)
+        setRewriteModeOpen(true, animated: true)
+    }
+
+    func showAIRewriteDisclosure() {
+        rebuildRewriteDisclosureToolbar()
+        setRewriteModeOpen(true, animated: true)
+    }
+
+    func showToolbarMessage(_ message: String) {
+        rebuildRewriteMessageToolbar(message)
+        setRewriteModeOpen(true, animated: true)
+    }
+
+    func hideAIRewriteMode(animated: Bool = true) {
+        setRewriteModeOpen(false, animated: animated)
     }
 
     func setSessionName(_ name: String) {
@@ -327,7 +369,10 @@ final class KeyboardSurfaceView: UIView {
         suggestionRowHeightConstraint = height
 
         buildAutocompleteToolbar()
+        buildRewriteToolbar()
         buildCollapsedToolbar()
+        rewriteStack.alpha = 0
+        rewriteStack.isUserInteractionEnabled = false
         collapsedToolbar.alpha = 0
     }
 
@@ -343,6 +388,12 @@ final class KeyboardSurfaceView: UIView {
             suggestionStack.topAnchor.constraint(equalTo: toolbarSlot.topAnchor),
             suggestionStack.bottomAnchor.constraint(equalTo: toolbarSlot.bottomAnchor)
         ])
+
+        clipboardButton = makeToolbarIconButton(systemName: "doc.on.clipboard", accessibilityLabel: "Paste clipboard")
+        clipboardButton.addTarget(self, action: #selector(controlTouchDown(_:)), for: .touchDown)
+        clipboardButton.addTarget(self, action: #selector(clipboardTapped(_:)), for: .touchUpInside)
+        clipboardButton.addTarget(self, action: #selector(controlTouchCancelled(_:)), for: [.touchUpOutside, .touchCancel, .touchDragExit])
+        suggestionStack.addArrangedSubview(clipboardButton)
 
         sessionButton = makePersonaButton(title: "AT")
         sessionButton.widthAnchor.constraint(equalToConstant: 42).isActive = true
@@ -368,11 +419,33 @@ final class KeyboardSurfaceView: UIView {
         }
         suggestionStack.addArrangedSubview(chipsContainer)
 
+        aiRewriteButton = makeToolbarIconButton(systemName: "sparkles", accessibilityLabel: "AI rewrite")
+        aiRewriteButton.addTarget(self, action: #selector(controlTouchDown(_:)), for: .touchDown)
+        aiRewriteButton.addTarget(self, action: #selector(aiRewriteTapped(_:)), for: .touchUpInside)
+        aiRewriteButton.addTarget(self, action: #selector(controlTouchCancelled(_:)), for: [.touchUpOutside, .touchCancel, .touchDragExit])
+        suggestionStack.addArrangedSubview(aiRewriteButton)
+
         // toolbarToggleButton = makeToolbarChevron(expanded: false)
         // toolbarToggleButton.addTarget(self, action: #selector(toolbarToggleTapped), for: .touchUpInside)
         // suggestionStack.addArrangedSubview(toolbarToggleButton)
 
         buildSuggestionSeparators()
+    }
+
+    private func buildRewriteToolbar() {
+        rewriteStack.axis = .horizontal
+        rewriteStack.spacing = 6
+        rewriteStack.distribution = .fill
+        rewriteStack.alignment = .center
+        rewriteStack.translatesAutoresizingMaskIntoConstraints = false
+        toolbarSlot.addSubview(rewriteStack)
+        NSLayoutConstraint.activate([
+            rewriteStack.leadingAnchor.constraint(equalTo: toolbarSlot.leadingAnchor, constant: 6),
+            rewriteStack.trailingAnchor.constraint(equalTo: toolbarSlot.trailingAnchor, constant: -6),
+            rewriteStack.topAnchor.constraint(equalTo: toolbarSlot.topAnchor),
+            rewriteStack.bottomAnchor.constraint(equalTo: toolbarSlot.bottomAnchor)
+        ])
+        rebuildRewriteStyleToolbar()
     }
 
     private func buildCollapsedToolbar() {
@@ -576,20 +649,42 @@ final class KeyboardSurfaceView: UIView {
         layout.itemSize = CGSize(width: 44, height: 32)
         layout.minimumInteritemSpacing = 2
         layout.minimumLineSpacing = 6
-        layout.sectionInset = UIEdgeInsets(top: 2, left: 18, bottom: 2, right: 18)
+        layout.sectionInset = UIEdgeInsets(top: 2, left: 10, bottom: 2, right: 10)
+
+        let emojiRowCount: CGFloat = 3
+        let gridHeight = layout.sectionInset.top
+            + layout.sectionInset.bottom
+            + layout.itemSize.height * emojiRowCount
+            + layout.minimumInteritemSpacing * (emojiRowCount - 1)
+
+        let container = UIView()
+        container.clipsToBounds = true
+        container.translatesAutoresizingMaskIntoConstraints = false
+        let containerHeight = container.heightAnchor.constraint(equalToConstant: gridHeight)
+        containerHeight.priority = .required
+        containerHeight.isActive = true
+        container.setContentHuggingPriority(.required, for: .vertical)
+        container.setContentCompressionResistancePriority(.required, for: .vertical)
 
         let collection = UICollectionView(frame: .zero, collectionViewLayout: layout)
         collection.backgroundColor = .clear
+        collection.clipsToBounds = true
         collection.showsHorizontalScrollIndicator = false
         collection.alwaysBounceHorizontal = true
         collection.dataSource = self
         collection.delegate = self
         collection.register(EmojiCell.self, forCellWithReuseIdentifier: EmojiCell.reuseIdentifier)
-        let height = collection.heightAnchor.constraint(equalToConstant: 138)
-        height.priority = .defaultHigh
-        height.isActive = true
+        collection.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(collection)
 
-        keyStack.addArrangedSubview(collection)
+        NSLayoutConstraint.activate([
+            collection.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            collection.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            collection.topAnchor.constraint(equalTo: container.topAnchor),
+            collection.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+        ])
+
+        keyStack.addArrangedSubview(container)
     }
 
     private func selectedEmojiItems() -> [EmojiCatalogItem] {
@@ -699,11 +794,8 @@ final class KeyboardSurfaceView: UIView {
         search.addTarget(self, action: #selector(emojiSearchTapped), for: .touchUpInside)
         container.addSubview(search)
 
-        let brand = UILabel()
-        brand.text = "K"
-        brand.font = .systemFont(ofSize: 20, weight: .bold)
-        brand.textColor = .white
-        brand.textAlignment = .center
+        let brand = UIImageView(image: UIImage(named: "KeygramIcon"))
+        brand.contentMode = .scaleAspectFill
         brand.backgroundColor = .systemBlue
         brand.layer.cornerRadius = 15
         brand.clipsToBounds = true
@@ -718,18 +810,18 @@ final class KeyboardSurfaceView: UIView {
         search.addSubview(label)
 
         NSLayoutConstraint.activate([
-            brand.leadingAnchor.constraint(equalTo: search.leadingAnchor, constant: 18),
+            brand.leadingAnchor.constraint(equalTo: search.leadingAnchor, constant: 14),
             brand.centerYAnchor.constraint(equalTo: search.centerYAnchor),
             brand.widthAnchor.constraint(equalToConstant: 30),
             brand.heightAnchor.constraint(equalToConstant: 30),
             label.leadingAnchor.constraint(equalTo: brand.trailingAnchor, constant: 12),
             label.centerYAnchor.constraint(equalTo: search.centerYAnchor),
-            label.trailingAnchor.constraint(lessThanOrEqualTo: search.trailingAnchor, constant: -16)
+            label.trailingAnchor.constraint(lessThanOrEqualTo: search.trailingAnchor, constant: -12)
         ])
 
         NSLayoutConstraint.activate([
-            search.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 20),
-            search.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -20),
+            search.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 10),
+            search.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -10),
             search.topAnchor.constraint(equalTo: container.topAnchor, constant: 10),
             search.bottomAnchor.constraint(equalTo: container.bottomAnchor)
         ])
@@ -830,24 +922,26 @@ final class KeyboardSurfaceView: UIView {
             selectedEmojiCategoryIndex = max(0, categories.count - 1)
         }
 
-        let scroll = UIScrollView()
-        scroll.showsHorizontalScrollIndicator = false
-        scroll.alwaysBounceHorizontal = true
-        scroll.heightAnchor.constraint(equalToConstant: 46).isActive = true
+        let container = UIView()
+        container.clipsToBounds = true
+        container.heightAnchor.constraint(equalToConstant: 32).isActive = true
 
         let row = UIStackView()
         row.axis = .horizontal
         row.alignment = .center
-        row.spacing = 14
+        row.spacing = 8
         row.translatesAutoresizingMaskIntoConstraints = false
-        scroll.addSubview(row)
+        container.addSubview(row)
 
+        let leadingGuard = row.leadingAnchor.constraint(greaterThanOrEqualTo: container.leadingAnchor, constant: 10)
+        leadingGuard.priority = .defaultHigh
+        let trailingGuard = row.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -10)
+        trailingGuard.priority = .defaultHigh
         NSLayoutConstraint.activate([
-            row.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor, constant: 18),
-            row.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor, constant: -18),
-            row.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor),
-            row.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor),
-            row.heightAnchor.constraint(equalTo: scroll.frameLayoutGuide.heightAnchor)
+            row.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            row.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            leadingGuard,
+            trailingGuard
         ])
 
         for (index, category) in categories.enumerated() {
@@ -858,7 +952,8 @@ final class KeyboardSurfaceView: UIView {
             row.addArrangedSubview(button)
         }
 
-        keyStack.addArrangedSubview(scroll)
+        keyStack.addArrangedSubview(container)
+        keyStack.setCustomSpacing(0, after: container)
     }
 
     private func addEmojiModeToolbar() {
@@ -871,31 +966,43 @@ final class KeyboardSurfaceView: UIView {
 
         let abc = makeKey(.modeToggle, title: "ABC", width: 72)
         abc.backgroundColor = .clear
-        abc.titleLabel?.font = .systemFont(ofSize: 24, weight: .regular)
+        abc.titleLabel?.font = .systemFont(ofSize: 18, weight: .regular)
         toolbar.addArrangedSubview(abc)
 
         toolbar.addArrangedSubview(FlexibleSpacerView())
 
+        let modeButtonGroup = UIStackView()
+        modeButtonGroup.axis = .horizontal
+        modeButtonGroup.alignment = .center
+        modeButtonGroup.spacing = 8
+        modeButtonGroup.distribution = .fill
+
         let emojiButton = makeEmojiModeButton(systemName: "face.smiling", title: nil, selected: emojiPanelMode == .emojis)
         emojiButton.addTarget(self, action: #selector(emojiCategoryTapped), for: .touchUpInside)
-        toolbar.addArrangedSubview(emojiButton)
+        modeButtonGroup.addArrangedSubview(emojiButton)
 
         let stickerButton = makeEmojiModeButton(systemName: "face.smiling.inverse", title: nil, selected: false)
         stickerButton.isEnabled = false
-        toolbar.addArrangedSubview(stickerButton)
+        modeButtonGroup.addArrangedSubview(stickerButton)
 
         let gifButton = makeEmojiModeButton(systemName: nil, title: "GIF", selected: false)
         gifButton.isEnabled = false
-        toolbar.addArrangedSubview(gifButton)
+        modeButtonGroup.addArrangedSubview(gifButton)
 
         let emoticonButton = makeEmojiModeButton(systemName: nil, title: ":-)", selected: false)
         emoticonButton.isEnabled = false
-        toolbar.addArrangedSubview(emoticonButton)
+        modeButtonGroup.addArrangedSubview(emoticonButton)
+
+        toolbar.addArrangedSubview(modeButtonGroup)
+        modeButtonGroup.centerXAnchor.constraint(equalTo: toolbar.centerXAnchor).isActive = true
 
         toolbar.addArrangedSubview(FlexibleSpacerView())
 
         let backspace = makeKey(.backspace, title: "delete.left", width: 48)
         backspace.backgroundColor = .clear
+        let backspaceConfiguration = UIImage.SymbolConfiguration(pointSize: 18, weight: .regular)
+        backspace.setImage(UIImage(systemName: "delete.left", withConfiguration: backspaceConfiguration), for: .normal)
+        backspace.setPreferredSymbolConfiguration(backspaceConfiguration, forImageIn: .normal)
         backspace.addGestureRecognizer(UILongPressGestureRecognizer(target: self, action: #selector(backspaceLongPressed(_:))))
         toolbar.addArrangedSubview(backspace)
 
@@ -1182,6 +1289,122 @@ final class KeyboardSurfaceView: UIView {
         return button
     }
 
+    private func makeToolbarIconButton(systemName: String, accessibilityLabel: String) -> UIButton {
+        let button = UIButton(type: .system)
+        button.setImage(UIImage(systemName: systemName), for: .normal)
+        button.tintColor = .label
+        button.accessibilityLabel = accessibilityLabel
+        button.widthAnchor.constraint(equalToConstant: 42).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 38).isActive = true
+        button.imageView?.contentMode = .scaleAspectFit
+        button.setContentHuggingPriority(.required, for: .horizontal)
+        button.setContentCompressionResistancePriority(.required, for: .horizontal)
+        return button
+    }
+
+    private func makeRewriteButton(title: String, systemImage: String? = nil) -> UIButton {
+        let button = UIButton(type: .system)
+        var configuration = UIButton.Configuration.gray()
+        configuration.title = title
+        if let systemImage {
+            configuration.image = UIImage(systemName: systemImage)
+        }
+        configuration.imagePadding = 4
+        configuration.imagePlacement = .leading
+        configuration.baseForegroundColor = .label
+        configuration.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 8, bottom: 4, trailing: 8)
+        configuration.background.backgroundColor = UIColor.secondarySystemBackground.withAlphaComponent(0.92)
+        configuration.background.cornerRadius = 6
+        var titleAttributes = AttributeContainer()
+        titleAttributes.font = .systemFont(ofSize: 12, weight: .semibold)
+        configuration.attributedTitle = AttributedString(title, attributes: titleAttributes)
+        button.configuration = configuration
+        button.titleLabel?.lineBreakMode = .byTruncatingTail
+        button.titleLabel?.adjustsFontSizeToFitWidth = true
+        button.titleLabel?.minimumScaleFactor = 0.72
+        button.heightAnchor.constraint(equalToConstant: 30).isActive = true
+        return button
+    }
+
+    private func rebuildRewriteStyleToolbar(loadingStyle: AIRewriteStyle? = nil) {
+        clearRewriteToolbar()
+        rewriteStyleButtons.removeAll()
+
+        for style in AIRewriteStyle.allCases {
+            let title = loadingStyle == style ? "..." : style.title
+            let button = makeRewriteButton(title: title)
+            button.tag = AIRewriteStyle.allCases.firstIndex(of: style) ?? 0
+            button.accessibilityLabel = style.accessibilityLabel
+            button.isEnabled = loadingStyle == nil
+            button.alpha = loadingStyle == nil || loadingStyle == style ? 1 : 0.45
+            button.addTarget(self, action: #selector(controlTouchDown(_:)), for: .touchDown)
+            button.addTarget(self, action: #selector(rewriteStyleTapped(_:)), for: .touchUpInside)
+            button.addTarget(self, action: #selector(controlTouchCancelled(_:)), for: [.touchUpOutside, .touchCancel, .touchDragExit])
+            rewriteStyleButtons[style] = button
+            rewriteStack.addArrangedSubview(button)
+        }
+
+        let cancel = makeRewriteButton(title: "Cancel", systemImage: "xmark")
+        cancel.addTarget(self, action: #selector(rewriteCancelTapped(_:)), for: .touchUpInside)
+        cancel.isEnabled = loadingStyle == nil
+        cancel.alpha = loadingStyle == nil ? 1 : 0.45
+        cancel.setContentHuggingPriority(.required, for: .horizontal)
+        cancel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        rewriteCancelButton = cancel
+        rewriteStack.addArrangedSubview(cancel)
+    }
+
+    private func rebuildRewriteDisclosureToolbar() {
+        clearRewriteToolbar()
+
+        let label = UILabel()
+        label.text = "AI sends selected text to OpenRouter"
+        label.font = .systemFont(ofSize: 12, weight: .semibold)
+        label.textColor = .secondaryLabel
+        label.lineBreakMode = .byTruncatingTail
+        label.minimumScaleFactor = 0.72
+        label.adjustsFontSizeToFitWidth = true
+        rewriteStack.addArrangedSubview(label)
+
+        let continueButton = makeRewriteButton(title: "Continue")
+        continueButton.addTarget(self, action: #selector(rewriteDisclosureContinueTapped(_:)), for: .touchUpInside)
+        continueButton.setContentHuggingPriority(.required, for: .horizontal)
+        continueButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+        rewriteDisclosureContinueButton = continueButton
+        rewriteStack.addArrangedSubview(continueButton)
+
+        let cancel = makeRewriteButton(title: "Cancel")
+        cancel.addTarget(self, action: #selector(rewriteCancelTapped(_:)), for: .touchUpInside)
+        cancel.setContentHuggingPriority(.required, for: .horizontal)
+        cancel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        rewriteDisclosureCancelButton = cancel
+        rewriteStack.addArrangedSubview(cancel)
+    }
+
+    private func rebuildRewriteMessageToolbar(_ message: String) {
+        clearRewriteToolbar()
+
+        let label = UILabel()
+        label.text = message
+        label.font = .systemFont(ofSize: 13, weight: .semibold)
+        label.textColor = .secondaryLabel
+        label.textAlignment = .center
+        label.lineBreakMode = .byTruncatingTail
+        label.minimumScaleFactor = 0.75
+        label.adjustsFontSizeToFitWidth = true
+        rewriteStack.addArrangedSubview(label)
+    }
+
+    private func clearRewriteToolbar() {
+        rewriteStack.arrangedSubviews.forEach { view in
+            rewriteStack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+        rewriteCancelButton = nil
+        rewriteDisclosureContinueButton = nil
+        rewriteDisclosureCancelButton = nil
+    }
+
     private func setSuggestionTitle(_ title: String, for button: UIButton) {
         guard button.title(for: .normal) != title else { return }
         button.setTitle(title, for: .normal)
@@ -1417,33 +1640,38 @@ final class KeyboardSurfaceView: UIView {
 
     private func makeEmojiCategoryButton(systemName: String, selected: Bool) -> UIButton {
         let button = UIButton(type: .system)
-        button.setImage(UIImage(systemName: systemName), for: .normal)
+        let configuration = UIImage.SymbolConfiguration(pointSize: 16, weight: .regular)
+        button.setImage(UIImage(systemName: systemName, withConfiguration: configuration), for: .normal)
+        button.setPreferredSymbolConfiguration(configuration, forImageIn: .normal)
         button.tintColor = .label
         button.backgroundColor = selected ? UIColor { trait in
             trait.userInterfaceStyle == .dark ? UIColor(red: 0.32, green: 0.33, blue: 0.35, alpha: 1) : UIColor(red: 207 / 255, green: 211 / 255, blue: 219 / 255, alpha: 1)
         } : .clear
         button.alpha = selected ? 1 : 0.95
-        button.layer.cornerRadius = 20
-        button.widthAnchor.constraint(equalToConstant: 40).isActive = true
-        button.heightAnchor.constraint(equalToConstant: 40).isActive = true
-        button.imageView?.contentMode = .scaleAspectFit
+        button.layer.cornerRadius = 13
+        button.widthAnchor.constraint(equalToConstant: 26).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 26).isActive = true
+        button.imageView?.contentMode = .center
         return button
     }
 
     private func makeEmojiModeButton(systemName: String?, title: String?, selected: Bool) -> UIButton {
         let button = UIButton(type: .system)
         if let systemName {
-            button.setImage(UIImage(systemName: systemName), for: .normal)
+            let configuration = UIImage.SymbolConfiguration(pointSize: 18, weight: .regular)
+            button.setImage(UIImage(systemName: systemName, withConfiguration: configuration), for: .normal)
+            button.setPreferredSymbolConfiguration(configuration, forImageIn: .normal)
         }
         if let title {
             button.setTitle(title, for: .normal)
-            button.titleLabel?.font = .systemFont(ofSize: 20, weight: .bold)
+            button.titleLabel?.font = .systemFont(ofSize: 18, weight: .bold)
         }
         button.tintColor = selected ? .systemBlue : .label
         button.setTitleColor(selected ? .systemBlue : .label, for: .normal)
         button.alpha = button.isEnabled ? 1 : 0.95
-        button.widthAnchor.constraint(equalToConstant: 48).isActive = true
+        button.widthAnchor.constraint(equalToConstant: 30).isActive = true
         button.heightAnchor.constraint(equalToConstant: 48).isActive = true
+        button.imageView?.contentMode = .center
         return button
     }
 
@@ -1757,6 +1985,34 @@ final class KeyboardSurfaceView: UIView {
         )
     }
 
+    @objc private func clipboardTapped(_ sender: UIButton) {
+        _ = consumeTouchTiming(for: sender)
+        delegate?.keyboardSurfaceViewDidTapClipboard(self)
+    }
+
+    @objc private func aiRewriteTapped(_ sender: UIButton) {
+        _ = consumeTouchTiming(for: sender)
+        delegate?.keyboardSurfaceViewDidTapAIRewrite(self)
+    }
+
+    @objc private func rewriteStyleTapped(_ sender: UIButton) {
+        let touchTiming = consumeTouchTiming(for: sender)
+        guard AIRewriteStyle.allCases.indices.contains(sender.tag) else { return }
+        _ = touchTiming
+        delegate?.keyboardSurfaceView(self, didSelectAIRewriteStyle: AIRewriteStyle.allCases[sender.tag])
+    }
+
+    @objc private func rewriteDisclosureContinueTapped(_ sender: UIButton) {
+        _ = consumeTouchTiming(for: sender)
+        delegate?.keyboardSurfaceViewDidAcceptAIRewriteDisclosure(self)
+    }
+
+    @objc private func rewriteCancelTapped(_ sender: UIButton) {
+        _ = consumeTouchTiming(for: sender)
+        hideAIRewriteMode()
+        delegate?.keyboardSurfaceViewDidCancelAIRewrite(self)
+    }
+
     @objc private func sessionTapped() {
         togglePersonaPicker()
     }
@@ -1816,6 +2072,9 @@ final class KeyboardSurfaceView: UIView {
     private func setMenuToggled(_ toggled: Bool, animated: Bool) {
         guard toggled != isMenuToggled else { return }
         isMenuToggled = toggled
+        if toggled {
+            hideAIRewriteMode(animated: false)
+        }
 
         let suggestionsAlpha: CGFloat = toggled ? 0 : 1
         let collapsedAlpha: CGFloat = toggled ? 1 : 0
@@ -1836,6 +2095,29 @@ final class KeyboardSurfaceView: UIView {
 
         if animated {
             UIView.animate(withDuration: 0.22, delay: 0, options: [.curveEaseInOut, .beginFromCurrentState], animations: block)
+        } else {
+            block()
+        }
+    }
+
+    private func setRewriteModeOpen(_ isOpen: Bool, animated: Bool) {
+        guard isOpen != isRewriteModeOpen || isOpen else { return }
+        isRewriteModeOpen = isOpen
+        if isOpen {
+            hidePersonaPicker()
+            setMenuToggled(false, animated: false)
+        }
+
+        let block = {
+            self.suggestionStack.alpha = isOpen ? 0 : 1
+            self.rewriteStack.alpha = isOpen ? 1 : 0
+            self.suggestionStack.isUserInteractionEnabled = !isOpen
+            self.rewriteStack.isUserInteractionEnabled = isOpen
+            self.updateSuggestionSeparators()
+        }
+
+        if animated {
+            UIView.animate(withDuration: 0.18, delay: 0, options: [.curveEaseInOut, .beginFromCurrentState], animations: block)
         } else {
             block()
         }

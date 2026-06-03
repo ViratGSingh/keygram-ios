@@ -4,6 +4,8 @@ enum AtlasConfiguration {
     static let appGroupIdentifier = "group.com.wooshir.keygram"
     static let hapticsEnabledKey = "atlas.hapticsEnabled"
     static let autocorrectEnabledKey = "atlas.autocorrectEnabled"
+    static let aiRewriteEnabledKey = "atlas.aiRewriteEnabled"
+    static let aiRewriteDisclosureAcceptedKey = "atlas.aiRewriteDisclosureAccepted"
     static let inferenceSuggestionsEnabledKey = "atlas.inferenceSuggestionsEnabled"
     static let personalizedAutocorrectEnabledKey = "atlas.personalizedAutocorrectEnabled"
     static let personalizedTypingEnabledKey = "atlas.personalizedTypingEnabled"

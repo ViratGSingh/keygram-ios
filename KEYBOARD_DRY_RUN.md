@@ -12,7 +12,7 @@ This file explains, in simple terms, how the custom keyboard works from launch t
 
 - `AtlasCore/AtlasAutocorrectEngine.swift` decides spelling corrections and completions using the compiled lexicon, frequency data, personal words, and feedback.
 
-- `AtlasCore/AtlasInferenceEngine.swift` ranks next-word suggestions and completions. In the keyboard extension, ONNX runtime is currently disabled, so suggestions use the fallback vocabulary/frequency path unless a runtime is wired in later.
+- `AtlasCore/AtlasInferenceEngine.swift` ranks next-word suggestions and completions. In the keyboard extension, it now tries to use the bundled ONNX model and falls back to vocabulary/frequency suggestions if the runtime or model cannot load.
 
 - `AtlasCore/KeygramDecoder.swift`, `TouchModel.swift`, and `TouchModelStore.swift` handle personalized touch learning. They learn where the user tends to tap and can later resolve near-miss taps if personalized typing is enabled.
 
@@ -189,7 +189,7 @@ Example: user types `teh` then taps space.
 
 5. `AtlasInferenceEngine.suggestions(...)` tokenizes the recent context and ranks candidates.
 
-6. Because the keyboard extension currently creates the inference engine with `runtime: nil`, model logits are not produced there. The engine falls back to vocabulary/frequency scores.
+6. For next-word prediction after a word boundary, the keyboard passes the last 10 words of context into the inference engine. If the ONNX runtime loads successfully, model logits are used; otherwise the engine falls back to vocabulary/frequency scores.
 
 7. `AtlasSuggestionRanker` combines candidate scores with personal `Engram` bias and returns top suggestions.
 
