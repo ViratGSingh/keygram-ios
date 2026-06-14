@@ -10,6 +10,10 @@
 		C9A884212FA740000072C58D /* AtlasKeyboard.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = C9A884202FA740000072C58D /* AtlasKeyboard.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		C9A884302FA850000072C58D /* onnxruntime in Frameworks */ = {isa = PBXBuildFile; productRef = C9A884312FA850000072C58D /* onnxruntime */; };
 		C9A884402FA850000072C58D /* SentencepieceTokenizer in Frameworks */ = {isa = PBXBuildFile; productRef = C9A884412FA850000072C58D /* SentencepieceTokenizer */; };
+		C9A884502FA860000072C58D /* AtlasKeyboard/Assets.xcassets/AppIcon@3x.png in Resources */ = {isa = PBXBuildFile; fileRef = C9A884512FA860000072C58D /* AtlasKeyboard/Assets.xcassets/AppIcon@3x.png */; };
+		C9A884522FA860000072C58D /* Configuration/LinkedAppIcons.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = C9A884532FA860000072C58D /* Configuration/LinkedAppIcons.xcassets */; };
+		C9A884542FA860000072C58D /* AtlasKeyboard/Assets.xcassets/AppIcon@3x.png in Resources */ = {isa = PBXBuildFile; fileRef = C9A884512FA860000072C58D /* AtlasKeyboard/Assets.xcassets/AppIcon@3x.png */; };
+		C9A884562FA870000072C58D /* keygram/Assets.xcassets/AppIcon.appiconset/AppIcon~ios-marketing.png in Resources */ = {isa = PBXBuildFile; fileRef = C9A884552FA870000072C58D /* keygram/Assets.xcassets/AppIcon.appiconset/AppIcon~ios-marketing.png */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -39,6 +43,9 @@
 /* Begin PBXFileReference section */
 		C9A883D02FA72F520072C58D /* keygram.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = keygram.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		C9A884202FA740000072C58D /* AtlasKeyboard.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = AtlasKeyboard.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		C9A884512FA860000072C58D /* AtlasKeyboard/Assets.xcassets/AppIcon@3x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "AtlasKeyboard/Assets.xcassets/AppIcon@3x.png"; sourceTree = SOURCE_ROOT; };
+		C9A884532FA860000072C58D /* Configuration/LinkedAppIcons.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Configuration/LinkedAppIcons.xcassets; sourceTree = SOURCE_ROOT; };
+		C9A884552FA870000072C58D /* keygram/Assets.xcassets/AppIcon.appiconset/AppIcon~ios-marketing.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "keygram/Assets.xcassets/AppIcon.appiconset/AppIcon~ios-marketing.png"; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -85,6 +92,9 @@
 				C9A883D22FA72F520072C58D /* keygram */,
 				C9A884162FA740000072C58D /* AtlasCore */,
 				C9A884172FA740000072C58D /* AtlasKeyboard */,
+				C9A884512FA860000072C58D /* AtlasKeyboard/Assets.xcassets/AppIcon@3x.png */,
+				C9A884532FA860000072C58D /* Configuration/LinkedAppIcons.xcassets */,
+				C9A884552FA870000072C58D /* keygram/Assets.xcassets/AppIcon.appiconset/AppIcon~ios-marketing.png */,
 				C9A883D12FA72F520072C58D /* Products */,
 			);
 			sourceTree = "<group>";
@@ -198,6 +208,9 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				C9A884542FA860000072C58D /* AtlasKeyboard/Assets.xcassets/AppIcon@3x.png in Resources */,
+				C9A884522FA860000072C58D /* Configuration/LinkedAppIcons.xcassets in Resources */,
+				C9A884562FA870000072C58D /* keygram/Assets.xcassets/AppIcon.appiconset/AppIcon~ios-marketing.png in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -205,6 +218,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				C9A884502FA860000072C58D /* AtlasKeyboard/Assets.xcassets/AppIcon@3x.png in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -360,7 +374,7 @@
 		C9A883DC2FA72F530072C58D /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_APPICON_NAME = MobileAppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = Configuration/keygram.entitlements;
 				CODE_SIGN_STYLE = Automatic;
@@ -369,7 +383,7 @@
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = Keygram;
-				INFOPLIST_KEY_CFBundleIconName = AppIcon;
+				INFOPLIST_KEY_CFBundleIconName = MobileAppIcon;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -395,7 +409,7 @@
 		C9A883DD2FA72F530072C58D /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_APPICON_NAME = MobileAppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = Configuration/keygram.entitlements;
 				CODE_SIGN_STYLE = Automatic;
@@ -404,7 +418,7 @@
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = Keygram;
-				INFOPLIST_KEY_CFBundleIconName = AppIcon;
+				INFOPLIST_KEY_CFBundleIconName = MobileAppIcon;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;

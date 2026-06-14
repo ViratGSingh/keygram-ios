@@ -48,13 +48,34 @@ enum AtlasSuggestionKind: String {
     case undoAutocorrection
 }
 
+private struct NextWordCandidateFeatures {
+    var text: String
+    var personalLogProbability: Double?
+    var personalHitCount: Int = 0
+    var personalOrder: Int = 0
+    var effortScore: Double = 0
+    var recencyBoost: Double = 0
+    var baseFrequencyScore: Double = 0
+    var isPhrase: Bool = false
+
+    mutating func absorbPersonalCandidate(_ candidate: PersonalNGramCandidate, weight: Double = 1.0) {
+        let weightedLogProbability = candidate.logProbability - max(0, 1.0 - weight) * 0.65
+        personalLogProbability = max(personalLogProbability ?? -.infinity, weightedLogProbability)
+        personalHitCount = max(personalHitCount, candidate.hitCount)
+        personalOrder = max(personalOrder, candidate.order)
+        effortScore = max(effortScore, candidate.effortScore * weight)
+        recencyBoost = max(recencyBoost, candidate.recencyBoost * weight)
+        isPhrase = isPhrase || candidate.isPhrase
+    }
+}
+
 final class AtlasInferenceEngine {
     private var state = AtlasInferenceState()
     private let tokenizer: AtlasTokenizing
     private let vocabulary: AtlasVocabularyIndex
     private let ranker = AtlasSuggestionRanker()
     private let modelBundle: AtlasModelBundle?
-    private let runtime: AtlasModelRuntime?
+    private var runtime: AtlasModelRuntime?
     private var lastRuntimeLogits: [Float]?
     private var lastProcessedContext = ""
 
@@ -94,7 +115,47 @@ final class AtlasInferenceEngine {
         tokenizer.resetTokenizationState()
     }
 
+    func discardRuntimeForMemoryPressure() {
+        runtime = nil
+        resetCurrentDraftMemory()
+    }
+
     func suggestions(for context: String, session: AtlasSession, globalEngram: Engram) -> [AtlasSuggestion] {
+        if !context.hasPrefix(lastProcessedContext) {
+            resetCurrentDraftMemory()
+        }
+
+        let partial = PartialWordDetector.partialWord(in: context)
+        if let partial, !partial.isEmpty {
+            advanceRuntime(to: context)
+            let logits = candidateScores(from: lastRuntimeLogits, context: context, limit: 128, session: session, globalEngram: globalEngram)
+            return ranker.rank(
+                logits: logits,
+                partialWord: partial,
+                vocabulary: vocabulary,
+                context: context,
+                sessionEngram: session.engram,
+                globalEngram: globalEngram
+            )
+        }
+
+        let shortlist = nextWordShortlist(for: context, session: session, globalEngram: globalEngram)
+        guard !shortlist.isEmpty else {
+            return fallbackNextWordSuggestions(context: context, session: session, globalEngram: globalEngram)
+        }
+
+        if shouldSkipAtlasRerank(shortlist) {
+            return rankNextWordShortlist(shortlist, atlasScores: [:], atlasWasAvailable: false)
+        }
+
+        advanceRuntime(to: context)
+        let atlasScores = lastRuntimeLogits.map {
+            tokenizer.candidateScores(from: $0, candidates: Array(shortlist.keys))
+        } ?? [:]
+        return rankNextWordShortlist(shortlist, atlasScores: atlasScores, atlasWasAvailable: runtime != nil)
+    }
+
+    private func advanceRuntime(to context: String) {
         if !context.hasPrefix(lastProcessedContext) {
             resetCurrentDraftMemory()
         }
@@ -104,17 +165,207 @@ final class AtlasInferenceEngine {
             step(tokenID: token)
         }
         lastProcessedContext = context
+    }
 
-        let partial = PartialWordDetector.partialWord(in: context)
-        let logits = candidateScores(from: lastRuntimeLogits, context: context, limit: 512, session: session, globalEngram: globalEngram)
+    private func fallbackNextWordSuggestions(context: String, session: AtlasSession, globalEngram: Engram) -> [AtlasSuggestion] {
+        let fallbackScores = vocabulary.fallbackScores(limit: AtlasConfiguration.maxSuggestions)
+        guard !fallbackScores.isEmpty else { return [] }
         return ranker.rank(
-            logits: logits,
-            partialWord: partial,
+            logits: fallbackScores,
+            partialWord: nil,
             vocabulary: vocabulary,
             context: context,
             sessionEngram: session.engram,
             globalEngram: globalEngram
         )
+    }
+
+    private func nextWordShortlist(
+        for context: String,
+        session: AtlasSession,
+        globalEngram: Engram
+    ) -> [String: NextWordCandidateFeatures] {
+        var candidates: [String: NextWordCandidateFeatures] = [:]
+
+        func feature(for text: String) -> NextWordCandidateFeatures {
+            candidates[text] ?? NextWordCandidateFeatures(text: text)
+        }
+
+        func store(_ feature: NextWordCandidateFeatures) {
+            candidates[feature.text] = feature
+        }
+
+        for candidate in session.engram.personalNextWordCandidates(for: context, limit: 72) {
+            var feature = feature(for: candidate.text)
+            feature.absorbPersonalCandidate(candidate)
+            store(feature)
+        }
+
+        for candidate in session.engram.personalPhraseCandidates(for: context, limit: 8) {
+            var feature = feature(for: candidate.text)
+            feature.absorbPersonalCandidate(candidate)
+            store(feature)
+        }
+
+        for candidate in globalEngram.personalNextWordCandidates(for: context, limit: 24) {
+            var feature = feature(for: candidate.text)
+            feature.absorbPersonalCandidate(candidate, weight: 0.72)
+            store(feature)
+        }
+
+        for entry in session.engram.confirmedWords(limit: 28) {
+            var feature = feature(for: entry.word)
+            feature.effortScore = max(feature.effortScore, min(1.0, log(Double(entry.acceptedCount + 1)) * 0.24))
+            feature.recencyBoost = max(feature.recencyBoost, session.engram.bias(for: entry.word, context: context) * 0.2)
+            store(feature)
+        }
+
+        for (word, score) in vocabulary.fallbackScores(limit: AtlasConfiguration.personalNGramCandidateLimit) {
+            var feature = feature(for: word)
+            feature.baseFrequencyScore = max(feature.baseFrequencyScore, score)
+            store(feature)
+        }
+
+        let ranked = candidates.values
+            .filter { isUsableNextWordCandidate($0.text) }
+            .sorted { preAtlasScore($0) > preAtlasScore($1) }
+            .prefix(AtlasConfiguration.personalNGramCandidateLimit)
+        return Dictionary(uniqueKeysWithValues: ranked.map { ($0.text, $0) })
+    }
+
+    private func shouldSkipAtlasRerank(_ shortlist: [String: NextWordCandidateFeatures]) -> Bool {
+        let personal = shortlist.values
+            .filter { $0.personalHitCount > 0 }
+            .sorted { preAtlasScore($0) > preAtlasScore($1) }
+        guard let best = personal.first else { return false }
+        let runnerUp = personal.dropFirst().first.map(preAtlasScore) ?? -.infinity
+        let margin = preAtlasScore(best) - runnerUp
+        return best.personalOrder >= 3
+            && best.personalHitCount >= 4
+            && margin >= 0.18
+    }
+
+    private func rankNextWordShortlist(
+        _ shortlist: [String: NextWordCandidateFeatures],
+        atlasScores: [String: Double],
+        atlasWasAvailable: Bool
+    ) -> [AtlasSuggestion] {
+        let bestAtlasScore = atlasScores.values.max()
+        let ranked = shortlist.values.map { feature -> (suggestion: AtlasSuggestion, isPhrase: Bool) in
+            let weights = interpolationWeights(for: feature, atlasWasAvailable: atlasWasAvailable && bestAtlasScore != nil)
+            let personalScore = personalEvidenceScore(feature)
+            let atlasScore = atlasScores[feature.text].map { rawScore -> Double in
+                guard let bestAtlasScore else { return -4.0 }
+                return max(-4.0, rawScore - bestAtlasScore)
+            } ?? 0
+            let baseScore = feature.baseFrequencyScore > 0
+                ? log(max(0.0001, feature.baseFrequencyScore))
+                : 0
+            let contextualPersonalBoost = feature.personalOrder >= 2
+                ? 0.8 + min(0.6, log(Double(feature.personalHitCount + 1)) * 0.35)
+                : 0
+
+            let score = personalScore * weights.personal
+                + atlasScore * weights.atlas
+                + baseScore * weights.baseFrequency
+                + feature.effortScore * weights.effort
+                + feature.recencyBoost * weights.recency
+                + contextualPersonalBoost
+                + (feature.isPhrase ? 0.06 : 0)
+
+            return (
+                AtlasSuggestion(
+                    text: feature.text,
+                    kind: feature.personalHitCount > 0 || feature.effortScore > 0.2 ? .personal : .nextWord,
+                    score: score
+                ),
+                feature.isPhrase
+            )
+        }
+
+        let deduped = Dictionary(grouping: ranked, by: { $0.suggestion.text.lowercased() })
+            .compactMap { $0.value.max { $0.suggestion.score < $1.suggestion.score } }
+            .sorted { $0.suggestion.score > $1.suggestion.score }
+
+        var result: [AtlasSuggestion] = []
+        var includedPhrase = false
+        for candidate in deduped {
+            if candidate.isPhrase {
+                guard !includedPhrase else { continue }
+                includedPhrase = true
+            }
+            result.append(candidate.suggestion)
+            if result.count == AtlasConfiguration.maxSuggestions {
+                break
+            }
+        }
+        return result
+    }
+
+    private func interpolationWeights(
+        for feature: NextWordCandidateFeatures,
+        atlasWasAvailable: Bool
+    ) -> (personal: Double, atlas: Double, baseFrequency: Double, effort: Double, recency: Double) {
+        let atlas: Double
+        let personal: Double
+        let base: Double
+
+        if feature.personalOrder >= 4 && feature.personalHitCount >= 6 {
+            personal = 0.82
+            atlas = 0.06
+            base = 0.06
+        } else if feature.personalOrder >= 3 && feature.personalHitCount >= 3 {
+            personal = 0.68
+            atlas = 0.18
+            base = 0.08
+        } else if feature.personalOrder >= 2 && feature.personalHitCount > 0 {
+            personal = 0.64
+            atlas = 0.18
+            base = 0.08
+        } else if feature.personalHitCount > 0 {
+            personal = 0.3
+            atlas = 0.4
+            base = 0.2
+        } else {
+            personal = 0.12
+            atlas = 0.52
+            base = 0.28
+        }
+
+        if atlasWasAvailable {
+            return (personal, atlas, base, 0.08, 0.06)
+        }
+
+        return (personal + atlas * 0.45, 0, base + atlas * 0.45, 0.08, 0.06)
+    }
+
+    private func preAtlasScore(_ feature: NextWordCandidateFeatures) -> Double {
+        personalEvidenceScore(feature)
+            + log(max(0.0001, feature.baseFrequencyScore)) * 0.18
+            + feature.effortScore * 0.22
+            + feature.recencyBoost * 0.18
+            + (feature.isPhrase ? 0.06 : 0)
+    }
+
+    private func personalEvidenceScore(_ feature: NextWordCandidateFeatures) -> Double {
+        guard let logProbability = feature.personalLogProbability,
+              feature.personalHitCount > 0
+        else {
+            return 0
+        }
+
+        let boundedLogProbability = max(-4.0, min(0, logProbability))
+        let contextualOrderBoost = Double(max(0, feature.personalOrder - 1)) * 0.5
+        let hitBoost = log(Double(feature.personalHitCount + 1)) * 0.55
+        return boundedLogProbability * 0.3 + contextualOrderBoost + hitBoost
+    }
+
+    private func isUsableNextWordCandidate(_ candidate: String) -> Bool {
+        let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed == candidate, !candidate.isEmpty else { return false }
+        let words = EngramNormalizer.ngramTokens(in: candidate)
+        guard !words.isEmpty, words.count <= 3 else { return false }
+        return words.joined(separator: " ") == candidate.lowercased()
     }
 
     func corrections(

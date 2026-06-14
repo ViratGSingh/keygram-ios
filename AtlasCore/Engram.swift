@@ -8,11 +8,46 @@ struct Engram: Codable, Equatable {
 
     private enum LearningThreshold {
         static let separateMomentInterval: TimeInterval = 60 * 60
-        static let normalPromotionMoments = 3
-        static let nearDictionaryPromotionMoments = 5
+        static let fullCreditTypingsPerWindow = 3
+        static let fullTypingCredit = 1.0
+        static let repeatedTypingCredit = 0.25
+        static let newWindowBonus = 3.0
+        static let suggestionAcceptanceCredit = 4.0
+        static let minimumActualTypings = 6
+        static let normalEvidence = 12.0
+        static let distanceTwoEvidence = 16.0
+        static let distanceOneEvidence = 24.0
+        static let rejectionEvidencePenalty = 4.0
     }
 
     private(set) var entries: [String: EngramEntry] = [:]
+    private(set) var ngramLanguageModel = PersonalNGramLanguageModel()
+
+    init(
+        entries: [String: EngramEntry] = [:],
+        ngramLanguageModel: PersonalNGramLanguageModel = PersonalNGramLanguageModel()
+    ) {
+        self.entries = entries
+        self.ngramLanguageModel = ngramLanguageModel
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case entries
+        case ngramLanguageModel
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        entries = try container.decodeIfPresent([String: EngramEntry].self, forKey: .entries) ?? [:]
+        ngramLanguageModel = try container.decodeIfPresent(PersonalNGramLanguageModel.self, forKey: .ngramLanguageModel)
+            ?? PersonalNGramLanguageModel()
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(entries, forKey: .entries)
+        try container.encode(ngramLanguageModel, forKey: .ngramLanguageModel)
+    }
 
     var sortedEntries: [EngramEntry] {
         entries.values.sorted { lhs, rhs in
@@ -23,31 +58,41 @@ struct Engram: Codable, Equatable {
         }
     }
 
-    mutating func learn(_ word: String, sessionName: String) {
+    mutating func acceptSuggestion(
+        _ word: String,
+        sessionName: String,
+        assessment: LearningAssessment = LearningAssessment()
+    ) {
         let normalized = EngramNormalizer.normalize(word)
-        guard EngramNormalizer.shouldLearnConfirmed(normalized) else { return }
+        let tokens = EngramNormalizer.ngramSurfaceTokens(in: word)
+        for token in tokens {
+            ngramLanguageModel.learn(tokens: [token])
+        }
+        guard EngramNormalizer.shouldObserve(normalized) else { return }
+        guard !assessment.isDictionaryWord else { return }
 
-        record(
+        recordEvidence(
             normalized,
             sessionName: sessionName,
             vector: PersonalEngramEmbedder.shared.vector(for: normalized),
-            confirmation: .explicit
+            source: .suggestion,
+            assessment: assessment
         )
     }
 
-    mutating func learnMessage(_ text: String, sessionName: String) {
-        let words = EngramNormalizer.contentWords(in: text)
-        guard !words.isEmpty else { return }
+    mutating func confirmAfterAutocorrectionUndo(_ word: String, sessionName: String) {
+        confirm(word, sessionName: sessionName, source: .autocorrectionUndo)
+    }
 
-        let uniqueWords = Array(Set(words)).sorted()
-        let vectors = PersonalEngramEmbedder.shared.vectors(for: uniqueWords)
-        for word in uniqueWords {
-            observe(
-                word,
-                sessionName: sessionName,
-                assessment: LearningAssessment(),
-                vector: vectors[word]
-            )
+    mutating func confirmManually(_ word: String, sessionName: String) {
+        confirm(word, sessionName: sessionName, source: .manual)
+    }
+
+    mutating func learnMessage(_ text: String, sessionName: String, includeNGrams: Bool = true) {
+        if includeNGrams {
+            for tokenSequence in EngramNormalizer.ngramSurfaceTokenSequences(in: text) {
+                ngramLanguageModel.learn(tokens: tokenSequence)
+            }
         }
     }
 
@@ -57,6 +102,10 @@ struct Engram: Codable, Equatable {
         assessment: LearningAssessment = LearningAssessment()
     ) {
         let normalized = EngramNormalizer.normalize(word)
+        let tokens = EngramNormalizer.ngramSurfaceTokens(in: word)
+        if tokens.count == 1 {
+            ngramLanguageModel.learn(tokens: tokens)
+        }
         guard EngramNormalizer.shouldObserve(normalized) else { return }
         guard !assessment.isDictionaryWord else { return }
 
@@ -73,6 +122,7 @@ struct Engram: Codable, Equatable {
         guard var entry = entries[normalized] else { return }
         entry.rejectedCount += 1
         entry.learningState = .provisional
+        entry.confirmationSource = nil
         entry.lastSeenAt = Date()
         entries[normalized] = entry
     }
@@ -81,12 +131,26 @@ struct Engram: Codable, Equatable {
         for (word, incoming) in other.entries {
             guard EngramNormalizer.shouldObserve(word) else { continue }
             if var existing = entries[word] {
+                let existingLastSeenAt = existing.lastSeenAt
                 existing.acceptedCount += incoming.acceptedCount
                 existing.rejectedCount += incoming.rejectedCount
                 existing.observedMomentCount += incoming.observedMomentCount
+                existing.actualTypingCount += incoming.actualTypingCount
+                existing.suggestionAcceptanceCount += incoming.suggestionAcceptanceCount
+                existing.evidencePoints += incoming.evidencePoints
                 existing.learningState = existing.learningState.merged(with: incoming.learningState)
                 existing.lastSeenAt = max(existing.lastSeenAt, incoming.lastSeenAt)
                 existing.lastObservedMomentAt = max(existing.lastObservedMomentAt, incoming.lastObservedMomentAt)
+                if incoming.typingWindowStartedAt > existing.typingWindowStartedAt {
+                    existing.typingWindowStartedAt = incoming.typingWindowStartedAt
+                    existing.typingsInCurrentWindow = incoming.typingsInCurrentWindow
+                }
+                if incoming.lastSeenAt >= existingLastSeenAt {
+                    existing.lastEvidenceSource = incoming.lastEvidenceSource
+                }
+                if existing.confirmationSource == nil {
+                    existing.confirmationSource = incoming.confirmationSource
+                }
                 existing.sessionHints.formUnion(incoming.sessionHints)
                 if existing.vector.isEmpty {
                     existing.vector = incoming.vector
@@ -96,11 +160,61 @@ struct Engram: Codable, Equatable {
                 entries[word] = incoming
             }
         }
+        ngramLanguageModel.merge(other.ngramLanguageModel)
+        pruneEntriesIfNeeded()
     }
 
     mutating func remove(_ word: String) {
         let normalized = EngramNormalizer.normalize(word)
         entries[normalized] = nil
+    }
+
+    mutating func resetNGramLanguageModel() {
+        ngramLanguageModel = PersonalNGramLanguageModel()
+    }
+
+    @discardableResult
+    mutating func reevaluateLearningStates(
+        assessmentFor: (String) -> LearningAssessment
+    ) -> (promoted: Int, demoted: Int) {
+        var promoted = 0
+        var demoted = 0
+        var trustedPersonalWords: [String] = []
+        let orderedWords = entries.values.sorted { lhs, rhs in
+            let lhsExplicit = lhs.confirmationSource?.isExplicit == true
+            let rhsExplicit = rhs.confirmationSource?.isExplicit == true
+            if lhsExplicit != rhsExplicit {
+                return lhsExplicit
+            }
+            if lhs.evidencePoints != rhs.evidencePoints {
+                return lhs.evidencePoints > rhs.evidencePoints
+            }
+            return lhs.acceptedCount > rhs.acceptedCount
+        }.map(\.word)
+
+        for word in orderedWords {
+            guard var entry = entries[word] else { continue }
+            let oldState = entry.learningState
+            let newState = promotionState(
+                for: entry,
+                assessment: assessmentFor(word),
+                confirmedPersonalWords: trustedPersonalWords
+            )
+            entry.learningState = newState
+            if newState == .confirmed {
+                trustedPersonalWords.append(word)
+            }
+            if oldState != newState {
+                if newState == .confirmed {
+                    promoted += 1
+                } else {
+                    demoted += 1
+                    entry.confirmationSource = nil
+                }
+            }
+            entries[word] = entry
+        }
+        return (promoted, demoted)
     }
 
     func bias(for candidate: String, context: String) -> Double {
@@ -183,16 +297,38 @@ struct Engram: Codable, Equatable {
         entries[EngramNormalizer.normalize(word)] != nil
     }
 
+    func confirmedWords(limit: Int = 32) -> [EngramEntry] {
+        Array(sortedEntries.filter(\.isConfirmed).prefix(limit))
+    }
+
+    func personalNextWordCandidates(for context: String, limit: Int = 60) -> [PersonalNGramCandidate] {
+        ngramLanguageModel.predictions(for: context, limit: limit)
+    }
+
+    func personalPhraseCandidates(for context: String, limit: Int = 6) -> [PersonalNGramCandidate] {
+        ngramLanguageModel.phrasePredictions(for: context, limit: limit)
+    }
+
+    mutating func learnLatestContext(_ text: String) {
+        guard let latestSequence = EngramNormalizer.ngramSurfaceTokenSequences(in: text).last else { return }
+        ngramLanguageModel.learnLatest(tokens: latestSequence)
+    }
+
+    func nextWordConfidence(for context: String) -> (hitCount: Int, order: Int, margin: Double) {
+        ngramLanguageModel.confidence(for: context)
+    }
+
     func entry(for word: String) -> EngramEntry? {
         entries[EngramNormalizer.normalize(word)]
     }
 
-    private enum ConfirmationSource {
-        case explicit
-        case observed(LearningAssessment)
-    }
-
-    private mutating func record(_ word: String, sessionName: String, vector: [Float]?, confirmation: ConfirmationSource) {
+    private mutating func recordEvidence(
+        _ word: String,
+        sessionName: String,
+        vector: [Float]?,
+        source: EngramEvidenceSource,
+        assessment: LearningAssessment
+    ) {
         var entry = entries[word] ?? EngramEntry(word: word)
         entry.acceptedCount += 1
         entry.lastSeenAt = Date()
@@ -200,43 +336,138 @@ struct Engram: Codable, Equatable {
         if entry.vector.isEmpty, let vector {
             entry.vector = vector
         }
-        switch confirmation {
-        case .explicit:
-            entry.learningState = .confirmed
-            entry.observedMomentCount = max(entry.observedMomentCount, 1)
-            entry.lastObservedMomentAt = entry.lastSeenAt
-        case .observed(let assessment):
-            entry.learningState = promotionState(for: entry, assessment: assessment)
+
+        switch source {
+        case .typed:
+            applyTypedEvidence(to: &entry, now: entry.lastSeenAt)
+        case .suggestion:
+            entry.suggestionAcceptanceCount += 1
+            entry.evidencePoints += LearningThreshold.suggestionAcceptanceCredit
+        case .autocorrectionUndo, .manual:
+            break
         }
+        entry.lastEvidenceSource = source
+
+        let newState = promotionState(for: entry, assessment: assessment)
+        if newState == .confirmed, entry.learningState != .confirmed {
+            entry.confirmationSource = source
+        }
+        entry.learningState = newState
         entries[word] = entry
+        pruneEntriesIfNeeded()
     }
 
     private mutating func observe(_ word: String, sessionName: String, assessment: LearningAssessment, vector: [Float]?) {
-        var entry = entries[word] ?? EngramEntry(word: word)
-        let now = Date()
-        if now.timeIntervalSince(entry.lastObservedMomentAt) >= LearningThreshold.separateMomentInterval {
+        recordEvidence(
+            word,
+            sessionName: sessionName,
+            vector: vector,
+            source: .typed,
+            assessment: assessment
+        )
+    }
+
+    private mutating func confirm(_ word: String, sessionName: String, source: EngramEvidenceSource) {
+        let normalized = EngramNormalizer.normalize(word)
+        let tokens = EngramNormalizer.ngramSurfaceTokens(in: word)
+        for token in tokens {
+            ngramLanguageModel.learn(tokens: [token])
+        }
+        guard EngramNormalizer.shouldLearnConfirmed(normalized) else { return }
+
+        var entry = entries[normalized] ?? EngramEntry(word: normalized)
+        entry.acceptedCount += 1
+        entry.lastSeenAt = Date()
+        entry.lastEvidenceSource = source
+        entry.confirmationSource = source
+        entry.learningState = .confirmed
+        entry.sessionHints.insert(sessionName)
+        if entry.vector.isEmpty,
+           let vector = PersonalEngramEmbedder.shared.vector(for: normalized) {
+            entry.vector = vector
+        }
+        entries[normalized] = entry
+        pruneEntriesIfNeeded()
+    }
+
+    private mutating func pruneEntriesIfNeeded() {
+        let limit = AtlasConfiguration.personalEngramMaxEntries
+        guard entries.count > limit else { return }
+
+        let kept = entries.values
+            .sorted { lhs, rhs in
+                let lhsExplicit = lhs.confirmationSource?.isExplicit == true
+                let rhsExplicit = rhs.confirmationSource?.isExplicit == true
+                if lhsExplicit != rhsExplicit { return lhsExplicit }
+                if lhs.isConfirmed != rhs.isConfirmed { return lhs.isConfirmed }
+                if lhs.evidencePoints != rhs.evidencePoints {
+                    return lhs.evidencePoints > rhs.evidencePoints
+                }
+                if lhs.acceptedCount != rhs.acceptedCount {
+                    return lhs.acceptedCount > rhs.acceptedCount
+                }
+                return lhs.lastSeenAt > rhs.lastSeenAt
+            }
+            .prefix(limit)
+        entries = Dictionary(uniqueKeysWithValues: kept.map { ($0.word, $0) })
+    }
+
+    private func applyTypedEvidence(to entry: inout EngramEntry, now: Date) {
+        let startsNewWindow = entry.typingWindowStartedAt == .distantPast
+            || now.timeIntervalSince(entry.typingWindowStartedAt) >= LearningThreshold.separateMomentInterval
+        if startsNewWindow {
+            if entry.actualTypingCount > 0 {
+                entry.evidencePoints += LearningThreshold.newWindowBonus
+            }
+            entry.typingWindowStartedAt = now
+            entry.typingsInCurrentWindow = 0
             entry.observedMomentCount += 1
             entry.lastObservedMomentAt = now
         }
-        entries[word] = entry
-        record(word, sessionName: sessionName, vector: vector, confirmation: .observed(assessment))
+
+        if entry.typingsInCurrentWindow < LearningThreshold.fullCreditTypingsPerWindow {
+            entry.evidencePoints += LearningThreshold.fullTypingCredit
+        } else {
+            entry.evidencePoints += LearningThreshold.repeatedTypingCredit
+        }
+        entry.typingsInCurrentWindow += 1
+        entry.actualTypingCount += 1
     }
 
-    private func promotionState(for entry: EngramEntry, assessment: LearningAssessment) -> EngramLearningState {
-        if entry.rejectedCount >= entry.acceptedCount {
+    private func promotionState(
+        for entry: EngramEntry,
+        assessment: LearningAssessment,
+        confirmedPersonalWords: [String]? = nil
+    ) -> EngramLearningState {
+        if entry.confirmationSource?.isExplicit == true {
+            return .confirmed
+        }
+        guard entry.actualTypingCount >= LearningThreshold.minimumActualTypings else {
             return .provisional
         }
 
-        let requiredMoments: Int
-        if EngramNormalizer.isProtectedPersonalToken(entry.word) {
-            requiredMoments = LearningThreshold.normalPromotionMoments
-        } else if assessment.nearestDictionaryDistance == 1 {
-            requiredMoments = LearningThreshold.nearDictionaryPromotionMoments + entry.rejectedCount
-        } else {
-            requiredMoments = LearningThreshold.normalPromotionMoments + min(entry.rejectedCount, 3)
+        let personalWords = confirmedPersonalWords ?? entries.values.compactMap {
+            $0.isConfirmed && $0.word != entry.word ? $0.word : nil
         }
+        let personalDistance = personalWords.lazy.compactMap {
+            AtlasSpellingMetrics.editDistance(entry.word, $0, maxDistance: 2)
+        }.min()
+        let nearestDistance = [assessment.nearestDictionaryDistance, personalDistance]
+            .compactMap { $0 }
+            .min()
 
-        return entry.observedMomentCount >= requiredMoments ? .confirmed : .provisional
+        let baseThreshold: Double
+        switch nearestDistance {
+        case 1:
+            baseThreshold = LearningThreshold.distanceOneEvidence
+        case 2:
+            baseThreshold = LearningThreshold.distanceTwoEvidence
+        default:
+            baseThreshold = LearningThreshold.normalEvidence
+        }
+        let requiredEvidence = baseThreshold
+            + Double(entry.rejectedCount) * LearningThreshold.rejectionEvidencePenalty
+        return entry.evidencePoints >= requiredEvidence ? .confirmed : .provisional
     }
 
     private func semanticBias(for entry: EngramEntry, context: String) -> Double? {
@@ -279,6 +510,13 @@ struct EngramEntry: Codable, Equatable, Identifiable {
     var learningState: EngramLearningState = .provisional
     var observedMomentCount: Int = 0
     var lastObservedMomentAt: Date = .distantPast
+    var actualTypingCount: Int = 0
+    var suggestionAcceptanceCount: Int = 0
+    var evidencePoints: Double = 0
+    var typingWindowStartedAt: Date = .distantPast
+    var typingsInCurrentWindow: Int = 0
+    var lastEvidenceSource: EngramEvidenceSource?
+    var confirmationSource: EngramEvidenceSource?
     var sessionHints: Set<String> = []
     var vector: [Float] = []
 
@@ -290,6 +528,13 @@ struct EngramEntry: Codable, Equatable, Identifiable {
         learningState: EngramLearningState = .provisional,
         observedMomentCount: Int = 0,
         lastObservedMomentAt: Date = .distantPast,
+        actualTypingCount: Int = 0,
+        suggestionAcceptanceCount: Int = 0,
+        evidencePoints: Double = 0,
+        typingWindowStartedAt: Date = .distantPast,
+        typingsInCurrentWindow: Int = 0,
+        lastEvidenceSource: EngramEvidenceSource? = nil,
+        confirmationSource: EngramEvidenceSource? = nil,
         sessionHints: Set<String> = [],
         vector: [Float] = []
     ) {
@@ -300,6 +545,13 @@ struct EngramEntry: Codable, Equatable, Identifiable {
         self.learningState = learningState
         self.observedMomentCount = observedMomentCount
         self.lastObservedMomentAt = lastObservedMomentAt
+        self.actualTypingCount = actualTypingCount
+        self.suggestionAcceptanceCount = suggestionAcceptanceCount
+        self.evidencePoints = evidencePoints
+        self.typingWindowStartedAt = typingWindowStartedAt
+        self.typingsInCurrentWindow = typingsInCurrentWindow
+        self.lastEvidenceSource = lastEvidenceSource
+        self.confirmationSource = confirmationSource
         self.sessionHints = sessionHints
         self.vector = vector
     }
@@ -312,6 +564,13 @@ struct EngramEntry: Codable, Equatable, Identifiable {
         case learningState
         case observedMomentCount
         case lastObservedMomentAt
+        case actualTypingCount
+        case suggestionAcceptanceCount
+        case evidencePoints
+        case typingWindowStartedAt
+        case typingsInCurrentWindow
+        case lastEvidenceSource
+        case confirmationSource
         case sessionHints
         case vector
     }
@@ -323,9 +582,24 @@ struct EngramEntry: Codable, Equatable, Identifiable {
         rejectedCount = try container.decodeIfPresent(Int.self, forKey: .rejectedCount) ?? 0
         lastSeenAt = try container.decodeIfPresent(Date.self, forKey: .lastSeenAt) ?? Date()
         learningState = try container.decodeIfPresent(EngramLearningState.self, forKey: .learningState)
-            ?? (acceptedCount >= 3 && rejectedCount == 0 ? .confirmed : .provisional)
-        observedMomentCount = try container.decodeIfPresent(Int.self, forKey: .observedMomentCount) ?? acceptedCount
+            ?? .provisional
+        observedMomentCount = try container.decodeIfPresent(Int.self, forKey: .observedMomentCount)
+            ?? (acceptedCount > 0 ? 1 : 0)
         lastObservedMomentAt = try container.decodeIfPresent(Date.self, forKey: .lastObservedMomentAt) ?? lastSeenAt
+        actualTypingCount = try container.decodeIfPresent(Int.self, forKey: .actualTypingCount) ?? acceptedCount
+        suggestionAcceptanceCount = try container.decodeIfPresent(Int.self, forKey: .suggestionAcceptanceCount) ?? 0
+        evidencePoints = try container.decodeIfPresent(Double.self, forKey: .evidencePoints)
+            ?? Self.legacyEvidence(
+                typingCount: actualTypingCount,
+                observedMoments: observedMomentCount
+            )
+        typingWindowStartedAt = try container.decodeIfPresent(Date.self, forKey: .typingWindowStartedAt)
+            ?? lastObservedMomentAt
+        typingsInCurrentWindow = try container.decodeIfPresent(Int.self, forKey: .typingsInCurrentWindow)
+            ?? (observedMomentCount <= 1 ? actualTypingCount : min(actualTypingCount, 3))
+        lastEvidenceSource = try container.decodeIfPresent(EngramEvidenceSource.self, forKey: .lastEvidenceSource)
+            ?? (acceptedCount > 0 ? .typed : nil)
+        confirmationSource = try container.decodeIfPresent(EngramEvidenceSource.self, forKey: .confirmationSource)
         sessionHints = try container.decodeIfPresent(Set<String>.self, forKey: .sessionHints) ?? []
         vector = try container.decodeIfPresent([Float].self, forKey: .vector) ?? []
     }
@@ -339,6 +613,13 @@ struct EngramEntry: Codable, Equatable, Identifiable {
         try container.encode(learningState, forKey: .learningState)
         try container.encode(observedMomentCount, forKey: .observedMomentCount)
         try container.encode(lastObservedMomentAt, forKey: .lastObservedMomentAt)
+        try container.encode(actualTypingCount, forKey: .actualTypingCount)
+        try container.encode(suggestionAcceptanceCount, forKey: .suggestionAcceptanceCount)
+        try container.encode(evidencePoints, forKey: .evidencePoints)
+        try container.encode(typingWindowStartedAt, forKey: .typingWindowStartedAt)
+        try container.encode(typingsInCurrentWindow, forKey: .typingsInCurrentWindow)
+        try container.encodeIfPresent(lastEvidenceSource, forKey: .lastEvidenceSource)
+        try container.encodeIfPresent(confirmationSource, forKey: .confirmationSource)
         try container.encode(sessionHints, forKey: .sessionHints)
         try container.encode(vector, forKey: .vector)
     }
@@ -350,6 +631,27 @@ struct EngramEntry: Codable, Equatable, Identifiable {
     var score: Double {
         let stateBoost = isConfirmed ? 10.0 : 0
         return stateBoost + Double(acceptedCount * 3 - rejectedCount * 2) + max(0, 30 - Date().timeIntervalSince(lastSeenAt) / 86_400)
+    }
+
+    private static func legacyEvidence(typingCount: Int, observedMoments: Int) -> Double {
+        guard typingCount > 0 else { return 0 }
+        let moments = max(1, min(typingCount, observedMoments))
+        let fullCreditTypings = min(typingCount, moments + 2)
+        let repeatedTypings = max(0, typingCount - fullCreditTypings)
+        return Double(fullCreditTypings)
+            + Double(repeatedTypings) * 0.25
+            + Double(moments - 1) * 3.0
+    }
+}
+
+enum EngramEvidenceSource: String, Codable, Equatable {
+    case typed
+    case suggestion
+    case autocorrectionUndo
+    case manual
+
+    var isExplicit: Bool {
+        self == .autocorrectionUndo || self == .manual
     }
 }
 
@@ -363,13 +665,13 @@ enum EngramLearningState: String, Codable, Equatable {
 }
 
 enum EngramNormalizer {
-    private static let protectedPersonalTokens: Set<String> = [
+    nonisolated private static let protectedPersonalTokens: Set<String> = [
         "af", "brb", "btw", "dm", "fr", "fyi", "gg", "idc", "idk", "ikr", "imo",
         "irl", "jk", "lmao", "lol", "ngl", "np", "omw", "rn", "smh", "tbh",
         "tfw", "wyd"
     ]
 
-    private static let blockedWords: Set<String> = [
+    nonisolated private static let blockedWords: Set<String> = [
         "i", "me", "my", "mine", "we", "us", "our", "you", "your", "he", "him",
         "his", "she", "her", "it", "its", "they", "them", "their", "this", "that",
         "these", "those", "who", "what", "which", "is", "are", "was", "were", "be",
@@ -397,16 +699,16 @@ enum EngramNormalizer {
         "set", "bit"
     ]
 
-    static func normalize(_ word: String) -> String {
+    nonisolated static func normalize(_ word: String) -> String {
         word.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
             .lowercased()
     }
 
-    static func shouldLearn(_ word: String) -> Bool {
+    nonisolated static func shouldLearn(_ word: String) -> Bool {
         shouldLearnConfirmed(word)
     }
 
-    static func shouldLearnConfirmed(_ word: String) -> Bool {
+    nonisolated static func shouldLearnConfirmed(_ word: String) -> Bool {
         if isProtectedPersonalToken(word) {
             return true
         }
@@ -415,7 +717,7 @@ enum EngramNormalizer {
         return isWordLike(word)
     }
 
-    static func shouldObserve(_ word: String) -> Bool {
+    nonisolated static func shouldObserve(_ word: String) -> Bool {
         if isProtectedPersonalToken(word) {
             return true
         }
@@ -424,20 +726,20 @@ enum EngramNormalizer {
         return isWordLike(word)
     }
 
-    static func isProtectedPersonalToken(_ word: String) -> Bool {
+    nonisolated static func isProtectedPersonalToken(_ word: String) -> Bool {
         protectedPersonalTokens.contains(word)
     }
 
-    private static func isWordLike(_ word: String) -> Bool {
+    nonisolated private static func isWordLike(_ word: String) -> Bool {
         word.rangeOfCharacter(from: .letters) != nil
             && word.rangeOfCharacter(from: CharacterSet.letters.union(CharacterSet(charactersIn: "'")).inverted) == nil
     }
 
-    static var commonWordsForAutocorrect: Set<String> {
+    nonisolated static var commonWordsForAutocorrect: Set<String> {
         blockedWords
     }
 
-    static func contentWords(in text: String) -> [String] {
+    nonisolated static func contentWords(in text: String) -> [String] {
         let pattern = #"[A-Za-z']+"#
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
@@ -446,5 +748,42 @@ enum EngramNormalizer {
             let normalized = normalize(String(text[wordRange]))
             return shouldLearn(normalized) ? normalized : nil
         }
+    }
+
+    nonisolated static func ngramTokens(in text: String) -> [String] {
+        ngramSurfaceTokens(in: text).map(normalize)
+    }
+
+    nonisolated static func ngramSurfaceTokens(in text: String) -> [String] {
+        let pattern = #"[A-Za-z']+"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.matches(in: text, range: range).compactMap { match in
+            guard let wordRange = Range(match.range, in: text) else { return nil }
+            let surface = String(text[wordRange])
+            let normalized = normalize(surface)
+            guard !normalized.isEmpty else { return nil }
+            guard normalized.rangeOfCharacter(from: .letters) != nil else { return nil }
+            return surface
+        }
+    }
+
+    nonisolated static func ngramSurfaceTokenSequences(in text: String) -> [[String]] {
+        let boundaryPattern = #"[.!?;\n\r]+"#
+        guard let boundaryRegex = try? NSRegularExpression(pattern: boundaryPattern) else {
+            let tokens = ngramSurfaceTokens(in: text)
+            return tokens.isEmpty ? [] : [tokens]
+        }
+
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        let separated = boundaryRegex.stringByReplacingMatches(
+            in: text,
+            range: range,
+            withTemplate: "\u{1E}"
+        )
+        return separated
+            .split(separator: "\u{1E}", omittingEmptySubsequences: true)
+            .map { ngramSurfaceTokens(in: String($0)) }
+            .filter { !$0.isEmpty }
     }
 }

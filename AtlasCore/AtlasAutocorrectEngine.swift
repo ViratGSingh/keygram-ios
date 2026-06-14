@@ -79,6 +79,9 @@ final class AtlasAutocorrectEngine {
         let isPersonalKnownWord = sessionEngram.containsConfirmed(normalized) || globalEngram.containsConfirmed(normalized)
 
         var candidates = candidates(for: normalized, sessionEngram: sessionEngram, globalEngram: globalEngram)
+        candidates.removeAll {
+            feedback.shouldSuppressCorrection(typed: normalized, candidate: $0)
+        }
         if isDictionaryWord {
             guard !isPersonalKnownWord else { return nil }
             candidates = candidates.filter { candidate in
@@ -130,11 +133,17 @@ final class AtlasAutocorrectEngine {
                 let scoreGap = best.score - (ranked.dropFirst().first?.score ?? (best.score - 1.0))
                 let directTypo = best.distance == 1 && best.keyboardPenalty <= 0.35
                 let onlyStrongCandidate = ranked.count == 1 && best.score >= 2.45
-                let acceptedByProbability = bestProbability >= 0.55 && margin >= 0.20
+                let acceptedByProbability = ranked.count > 1
+                    && bestProbability >= 0.55
+                    && margin >= 0.20
                 let acceptedByScoreGap = best.score >= 2.7 && scoreGap >= 0.18 && (directTypo || best.distance == 1)
 
                 splitDecision = splitCorrection(for: normalized)
                 if let splitDecision,
+                   !feedback.shouldSuppressCorrection(
+                       typed: normalized,
+                       candidate: splitDecision.replacement
+                   ),
                    shouldPreferSplit(splitDecision, over: best) {
                     return AtlasAutocorrectDecision(
                         original: typedWord,
@@ -158,7 +167,11 @@ final class AtlasAutocorrectEngine {
         if splitDecision == nil {
             splitDecision = splitCorrection(for: normalized)
         }
-        if let splitDecision {
+        if let splitDecision,
+           !feedback.shouldSuppressCorrection(
+               typed: normalized,
+               candidate: splitDecision.replacement
+           ) {
             return AtlasAutocorrectDecision(
                 original: typedWord,
                 replacement: token.preserveCase(applying: splitDecision.replacement),
@@ -449,9 +462,11 @@ final class AtlasAutocorrectEngine {
             candidate: candidate
         )
 
-        let acceptedBoost = min(2.0, log(Double(accepted + 1)) * 0.8)
+        let netAccepted = max(0, accepted - rejected)
+        let netRejected = max(0, rejected - accepted)
+        let acceptedBoost = min(2.0, log(Double(netAccepted + 1)) * 0.8)
         let contextBoost = min(1.5, log(Double(contextAccepted + 1)) * 0.9)
-        let rejectedPenalty = min(3.0, log(Double(rejected + 1)) * 1.2)
+        let rejectedPenalty = min(3.0, log(Double(netRejected + 1)) * 1.2)
         return acceptedBoost + contextBoost - rejectedPenalty
     }
 
@@ -588,14 +603,10 @@ private final class AtlasQuickSplitLexicon {
     private static var cachedByBundlePath: [String: AtlasQuickSplitLexicon] = [:]
     private static let cacheQueue = DispatchQueue(label: "com.wooshir.keygram.quick-split-lexicon")
 
-    private let frequencyByWord: [String: Double]
-    private let rankByWord: [String: Int]
-    private let commonWordsByLength: [Int: [String]]
-    private let dictionaryWordsByLength: [Int: [String]]
-    private let dictionaryWordSet: Set<String>
+    private let compiled: AtlasCompiledAutocorrectLexicon?
 
     var isAvailable: Bool {
-        !frequencyByWord.isEmpty && !dictionaryWordSet.isEmpty
+        compiled != nil
     }
 
     static func shared(bundle: Bundle) -> AtlasQuickSplitLexicon {
@@ -611,45 +622,19 @@ private final class AtlasQuickSplitLexicon {
     }
 
     private init(bundle: Bundle) {
-        guard let frequencyTable = AtlasAutocorrectDataLoader.loadFrequencyTable(named: "frequency_table", bundle: bundle),
-              AtlasAutocorrectDataLoader.isPlausibleFrequencyTable(frequencyTable)
-        else {
-            frequencyByWord = [:]
-            rankByWord = [:]
-            commonWordsByLength = [:]
-            dictionaryWordsByLength = [:]
-            dictionaryWordSet = []
-            return
-        }
-
-        let importedWords = AtlasAutocorrectDataLoader.loadWordList(named: "english_words", bundle: bundle) ?? []
-        let importedWordSet = Set(importedWords)
-        dictionaryWordSet = importedWordSet
-        dictionaryWordsByLength = Dictionary(grouping: importedWords, by: \.count)
-
-        let rankedWords = AtlasAutocorrectDataLoader
-            .topFrequencyWords(from: frequencyTable, limit: AtlasConfiguration.suggestionVocabularyLimit)
-            .filter { importedWordSet.contains($0) }
-        frequencyByWord = Dictionary(uniqueKeysWithValues: rankedWords.compactMap { word in
-            frequencyTable[word].map { (word, $0) }
-        })
-        rankByWord = Dictionary(uniqueKeysWithValues: rankedWords.enumerated().map { index, word in
-            (word, index + 1)
-        })
-        commonWordsByLength = Dictionary(grouping: rankedWords, by: \.count)
+        compiled = try? AtlasCompiledAutocorrectLexicon(bundle: bundle)
     }
 
     func isDictionaryWord(_ word: String) -> Bool {
-        dictionaryWordSet.contains(word)
+        compiled?.contains(word) == true
     }
 
     func hasDictionaryWordNear(_ word: String, maxDistance: Int) -> Bool {
-        let targetLength = word.count
-        let candidates = ((targetLength - maxDistance)...(targetLength + maxDistance))
-            .flatMap { dictionaryWordsByLength[$0] ?? [] }
-        return candidates.contains { candidate in
-            candidate != word && AtlasSpellingMetrics.editDistance(candidate, word, maxDistance: maxDistance) != nil
-        }
+        compiled?.correctionCandidates(
+            forNormalizedWord: word,
+            maxDistance: maxDistance,
+            limit: 1
+        ).isEmpty == false
     }
 
     func isStrongSplitWord(_ word: String) -> Bool {
@@ -659,7 +644,12 @@ private final class AtlasQuickSplitLexicon {
         if word.count >= 3, !AtlasSplitWordPolicy.commonSplitWords.contains(word) {
             return false
         }
-        guard dictionaryWordSet.contains(word), let rank = rankByWord[word] else { return false }
+        guard let compiled,
+              compiled.contains(word),
+              let rank = compiled.candidateRank(for: word)
+        else {
+            return false
+        }
         if word.count == 2 {
             return rank <= 500
         }
@@ -667,26 +657,15 @@ private final class AtlasQuickSplitLexicon {
     }
 
     func correctionCandidates(for raw: String, maxDistance: Int, limit: Int) -> [String] {
-        let targetLength = raw.count
-        var results: [(word: String, distance: Int)] = []
-        let candidates = ((targetLength - maxDistance)...(targetLength + maxDistance))
-            .flatMap { commonWordsByLength[$0] ?? [] }
-        for candidate in candidates {
-            guard let distance = AtlasSpellingMetrics.editDistance(raw, candidate, maxDistance: maxDistance) else { continue }
-            results.append((candidate, distance))
-        }
-
-        return results
-            .sorted { lhs, rhs in
-                if lhs.distance != rhs.distance { return lhs.distance < rhs.distance }
-                return frequency(for: lhs.word) > frequency(for: rhs.word)
-            }
-            .prefix(limit)
-            .map(\.word)
+        compiled?.correctionCandidates(
+            forNormalizedWord: raw,
+            maxDistance: maxDistance,
+            limit: limit
+        ) ?? []
     }
 
     func frequency(for word: String) -> Double {
-        max(1, frequencyByWord[word] ?? 1)
+        compiled?.frequency(for: word) ?? 1
     }
 }
 

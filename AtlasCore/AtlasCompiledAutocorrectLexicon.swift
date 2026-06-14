@@ -23,12 +23,22 @@ final class AtlasCompiledAutocorrectLexicon {
 
     private static let magic = Array("KGLEX001".utf8)
     private static let formatVersion: UInt32 = 1
+    private static let headerByteCount = 36
+    private static let wordRecordByteCount = 12
+    private static let candidateIDByteCount = 4
+    private static let deleteRecordByteCount = 16
 
-    private let words: [String]
-    private let frequencies: [Double]
-    private let candidateIDs: [Int]
-    private let deleteRecords: [DeleteRecord]
-    private let deleteCandidateIDs: [Int]
+    private let data: Data
+    private let wordCount: Int
+    private let candidateCount: Int
+    private let deleteEntryCount: Int
+    private let deleteCandidateCount: Int
+    private let wordRecordsOffset: Int
+    private let candidateIDsOffset: Int
+    private let deleteRecordsOffset: Int
+    private let deleteCandidateIDsOffset: Int
+    private let stringTableOffset: Int
+    private let stringTableByteCount: Int
 
     let diagnosticsDescription: String
 
@@ -37,99 +47,76 @@ final class AtlasCompiledAutocorrectLexicon {
             throw LoadError.missingResource
         }
 
-        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
-        var reader = BinaryReader(data: data)
-        let magic = try reader.readBytes(count: Self.magic.count)
-        guard magic == Self.magic else {
+        let mappedData = try Data(contentsOf: url, options: [.mappedIfSafe])
+        guard mappedData.count >= Self.headerByteCount else {
+            throw LoadError.invalidFormat("file is smaller than header")
+        }
+        guard Array(mappedData[0..<Self.magic.count]) == Self.magic else {
             throw LoadError.invalidFormat("bad magic")
         }
 
-        let version = try reader.readUInt32()
+        let version = Self.readUInt32(from: mappedData, at: 8)
         guard version == Self.formatVersion else {
             throw LoadError.invalidFormat("unsupported version \(version)")
         }
 
-        let wordCount = try reader.readCount("word count")
-        let candidateCount = try reader.readCount("candidate count")
-        let deleteEntryCount = try reader.readCount("delete entry count")
-        let deleteCandidateCount = try reader.readCount("delete candidate count")
-        let stringTableByteCount = try reader.readCount("string table byte count")
-        let diagnosticsByteCount = try reader.readCount("diagnostics byte count")
+        let loadedWordCount = Int(Self.readUInt32(from: mappedData, at: 12))
+        let loadedCandidateCount = Int(Self.readUInt32(from: mappedData, at: 16))
+        let loadedDeleteEntryCount = Int(Self.readUInt32(from: mappedData, at: 20))
+        let loadedDeleteCandidateCount = Int(Self.readUInt32(from: mappedData, at: 24))
+        let loadedStringTableByteCount = Int(Self.readUInt32(from: mappedData, at: 28))
+        let diagnosticsByteCount = Int(Self.readUInt32(from: mappedData, at: 32))
 
-        var wordRecords: [(offset: Int, length: Int, frequency: Double)] = []
-        wordRecords.reserveCapacity(wordCount)
-        for _ in 0..<wordCount {
-            let offset = try reader.readCount("word offset")
-            let length = Int(try reader.readUInt16())
-            _ = try reader.readUInt16()
-            let frequency = Double(try reader.readFloat32())
-            wordRecords.append((offset, length, frequency))
+        let loadedWordRecordsOffset = Self.headerByteCount
+        let loadedCandidateIDsOffset = try Self.checkedOffset(
+            loadedWordRecordsOffset,
+            adding: loadedWordCount,
+            stride: Self.wordRecordByteCount
+        )
+        let loadedDeleteRecordsOffset = try Self.checkedOffset(
+            loadedCandidateIDsOffset,
+            adding: loadedCandidateCount,
+            stride: Self.candidateIDByteCount
+        )
+        let loadedDeleteCandidateIDsOffset = try Self.checkedOffset(
+            loadedDeleteRecordsOffset,
+            adding: loadedDeleteEntryCount,
+            stride: Self.deleteRecordByteCount
+        )
+        let loadedStringTableOffset = try Self.checkedOffset(
+            loadedDeleteCandidateIDsOffset,
+            adding: loadedDeleteCandidateCount,
+            stride: Self.candidateIDByteCount
+        )
+        let diagnosticsOffset = try Self.checkedOffset(
+            loadedStringTableOffset,
+            adding: loadedStringTableByteCount,
+            stride: 1
+        )
+        let expectedByteCount = try Self.checkedOffset(
+            diagnosticsOffset,
+            adding: diagnosticsByteCount,
+            stride: 1
+        )
+        guard expectedByteCount == mappedData.count else {
+            throw LoadError.invalidFormat("unexpected file size")
         }
 
-        var loadedCandidateIDs: [Int] = []
-        loadedCandidateIDs.reserveCapacity(candidateCount)
-        for _ in 0..<candidateCount {
-            let id = try reader.readCount("candidate word id")
-            guard id < wordCount else {
-                throw LoadError.invalidFormat("candidate id out of range")
-            }
-            loadedCandidateIDs.append(id)
-        }
+        data = mappedData
+        wordCount = loadedWordCount
+        candidateCount = loadedCandidateCount
+        deleteEntryCount = loadedDeleteEntryCount
+        deleteCandidateCount = loadedDeleteCandidateCount
+        wordRecordsOffset = loadedWordRecordsOffset
+        candidateIDsOffset = loadedCandidateIDsOffset
+        deleteRecordsOffset = loadedDeleteRecordsOffset
+        deleteCandidateIDsOffset = loadedDeleteCandidateIDsOffset
+        stringTableOffset = loadedStringTableOffset
+        stringTableByteCount = loadedStringTableByteCount
 
-        var loadedDeleteRecords: [DeleteRecord] = []
-        loadedDeleteRecords.reserveCapacity(deleteEntryCount)
-        for _ in 0..<deleteEntryCount {
-            let hash = try reader.readUInt64()
-            let start = try reader.readCount("delete candidate start")
-            let count = try reader.readCount("delete candidate count")
-            guard start <= deleteCandidateCount, start + count <= deleteCandidateCount else {
-                throw LoadError.invalidFormat("delete candidate range out of bounds")
-            }
-            loadedDeleteRecords.append(DeleteRecord(hash: hash, start: start, count: count))
-        }
-
-        var loadedDeleteCandidateIDs: [Int] = []
-        loadedDeleteCandidateIDs.reserveCapacity(deleteCandidateCount)
-        for _ in 0..<deleteCandidateCount {
-            let id = try reader.readCount("delete candidate word id")
-            guard id < wordCount else {
-                throw LoadError.invalidFormat("delete candidate id out of range")
-            }
-            loadedDeleteCandidateIDs.append(id)
-        }
-
-        let stringTable = try reader.readBytes(count: stringTableByteCount)
-        var loadedWords: [String] = []
-        var loadedFrequencies: [Double] = []
-        loadedWords.reserveCapacity(wordCount)
-        loadedFrequencies.reserveCapacity(wordCount)
-        for record in wordRecords {
-            guard record.offset <= stringTable.count,
-                  record.offset + record.length <= stringTable.count
-            else {
-                throw LoadError.invalidFormat("word string range out of bounds")
-            }
-            let bytes = stringTable[record.offset..<(record.offset + record.length)]
-            loadedWords.append(String(decoding: bytes, as: UTF8.self))
-            loadedFrequencies.append(record.frequency)
-        }
-
-        for index in loadedWords.indices.dropFirst() where loadedWords[index - 1] > loadedWords[index] {
-            throw LoadError.invalidFormat("word table must be sorted")
-        }
-        for index in loadedDeleteRecords.indices.dropFirst() where loadedDeleteRecords[index - 1].hash > loadedDeleteRecords[index].hash {
-            throw LoadError.invalidFormat("delete records must be sorted")
-        }
-
-        let diagnosticsBytes = try reader.readBytes(count: diagnosticsByteCount)
-        let diagnostics = String(decoding: diagnosticsBytes, as: UTF8.self)
-
-        words = loadedWords
-        frequencies = loadedFrequencies
-        candidateIDs = loadedCandidateIDs
-        deleteRecords = loadedDeleteRecords
-        deleteCandidateIDs = loadedDeleteCandidateIDs
+        let diagnostics = String(decoding: data[diagnosticsOffset..<expectedByteCount], as: UTF8.self)
         diagnosticsDescription = "compiled=\(resourceName).kglex words=\(wordCount) candidates=\(candidateCount) deleteKeys=\(deleteEntryCount) deleteLinks=\(deleteCandidateCount); \(diagnostics)"
+        try validateIndexes()
     }
 
     func contains(_ word: String) -> Bool {
@@ -138,15 +125,34 @@ final class AtlasCompiledAutocorrectLexicon {
 
     func frequency(for word: String) -> Double {
         guard let id = wordID(for: word) else { return 8 }
-        return max(1, frequencies[id])
+        return max(1, frequency(forWordID: id))
+    }
+
+    func rankedCandidates(limit: Int) -> [(word: String, frequency: Double)] {
+        guard limit > 0 else { return [] }
+        var result: [(word: String, frequency: Double)] = []
+        result.reserveCapacity(min(limit, candidateCount))
+        for index in 0..<min(limit, candidateCount) {
+            let id = candidateID(at: index)
+            result.append((word(at: id), frequency(forWordID: id)))
+        }
+        return result
+    }
+
+    func candidateRank(for word: String) -> Int? {
+        guard let id = wordID(for: word) else { return nil }
+        for index in 0..<candidateCount where candidateID(at: index) == id {
+            return index + 1
+        }
+        return nil
     }
 
     func completions(forNormalizedPrefix prefix: String, limit: Int) -> [String] {
-        guard !prefix.isEmpty else { return [] }
+        guard !prefix.isEmpty, limit > 0 else { return [] }
         var results: [String] = []
         results.reserveCapacity(limit)
-        for id in candidateIDs {
-            let word = words[id]
+        for index in 0..<candidateCount {
+            let word = word(at: candidateID(at: index))
             guard word != prefix, word.hasPrefix(prefix) else { continue }
             results.append(word)
             if results.count >= limit { break }
@@ -162,19 +168,17 @@ final class AtlasCompiledAutocorrectLexicon {
         for key in Self.deletionKeys(for: word, maxDeletes: min(maxDistance, 1)) {
             guard let record = deleteRecord(forHash: Self.stableHash(key)) else { continue }
             let end = record.start + record.count
-            for candidateID in deleteCandidateIDs[record.start..<end] where seen.insert(candidateID).inserted {
-                let candidate = words[candidateID]
+            for index in record.start..<end {
+                let candidateID = deleteCandidateID(at: index)
+                guard seen.insert(candidateID).inserted else { continue }
+                let candidate = self.word(at: candidateID)
                 guard candidate != word, abs(candidate.count - word.count) <= maxDistance else { continue }
                 guard let distance = AtlasSpellingMetrics.editDistance(candidate, word, maxDistance: maxDistance) else { continue }
                 results.append((candidate, distance))
             }
         }
 
-        return sortedCandidates(results, limit: limit)
-    }
-
-    private func sortedCandidates(_ results: [(word: String, distance: Int)], limit: Int) -> [String] {
-        results
+        return results
             .sorted { lhs, rhs in
                 if lhs.distance != rhs.distance { return lhs.distance < rhs.distance }
                 return frequency(for: lhs.word) > frequency(for: rhs.word)
@@ -183,13 +187,52 @@ final class AtlasCompiledAutocorrectLexicon {
             .map(\.word)
     }
 
+    private func validateIndexes() throws {
+        var previousWord: String?
+        for id in 0..<wordCount {
+            let recordOffset = wordRecordsOffset + id * Self.wordRecordByteCount
+            let offset = Int(Self.readUInt32(from: data, at: recordOffset))
+            let length = Int(Self.readUInt16(from: data, at: recordOffset + 4))
+            guard offset <= stringTableByteCount, offset + length <= stringTableByteCount else {
+                throw LoadError.invalidFormat("word string range out of bounds")
+            }
+            let word = word(at: id)
+            if let previousWord, previousWord > word {
+                throw LoadError.invalidFormat("word table must be sorted")
+            }
+            previousWord = word
+        }
+
+        for index in 0..<candidateCount where candidateID(at: index) >= wordCount {
+            throw LoadError.invalidFormat("candidate id out of range")
+        }
+
+        var previousHash: UInt64?
+        for index in 0..<deleteEntryCount {
+            let record = deleteRecord(at: index)
+            guard record.start <= deleteCandidateCount,
+                  record.start + record.count <= deleteCandidateCount
+            else {
+                throw LoadError.invalidFormat("delete candidate range out of bounds")
+            }
+            if let previousHash, previousHash > record.hash {
+                throw LoadError.invalidFormat("delete records must be sorted")
+            }
+            previousHash = record.hash
+        }
+
+        for index in 0..<deleteCandidateCount where deleteCandidateID(at: index) >= wordCount {
+            throw LoadError.invalidFormat("delete candidate id out of range")
+        }
+    }
+
     private func wordID(for word: String) -> Int? {
         var lowerBound = 0
-        var upperBound = words.count
+        var upperBound = wordCount
 
         while lowerBound < upperBound {
             let midpoint = lowerBound + (upperBound - lowerBound) / 2
-            let candidate = words[midpoint]
+            let candidate = self.word(at: midpoint)
             if candidate == word {
                 return midpoint
             }
@@ -205,11 +248,11 @@ final class AtlasCompiledAutocorrectLexicon {
 
     private func deleteRecord(forHash hash: UInt64) -> DeleteRecord? {
         var lowerBound = 0
-        var upperBound = deleteRecords.count
+        var upperBound = deleteEntryCount
 
         while lowerBound < upperBound {
             let midpoint = lowerBound + (upperBound - lowerBound) / 2
-            let record = deleteRecords[midpoint]
+            let record = deleteRecord(at: midpoint)
             if record.hash == hash {
                 return record
             }
@@ -221,6 +264,36 @@ final class AtlasCompiledAutocorrectLexicon {
         }
 
         return nil
+    }
+
+    private func word(at id: Int) -> String {
+        let recordOffset = wordRecordsOffset + id * Self.wordRecordByteCount
+        let offset = Int(Self.readUInt32(from: data, at: recordOffset))
+        let length = Int(Self.readUInt16(from: data, at: recordOffset + 4))
+        let start = stringTableOffset + offset
+        return String(decoding: data[start..<(start + length)], as: UTF8.self)
+    }
+
+    private func frequency(forWordID id: Int) -> Double {
+        let offset = wordRecordsOffset + id * Self.wordRecordByteCount + 8
+        return Double(Float(bitPattern: Self.readUInt32(from: data, at: offset)))
+    }
+
+    private func candidateID(at index: Int) -> Int {
+        Int(Self.readUInt32(from: data, at: candidateIDsOffset + index * Self.candidateIDByteCount))
+    }
+
+    private func deleteRecord(at index: Int) -> DeleteRecord {
+        let offset = deleteRecordsOffset + index * Self.deleteRecordByteCount
+        return DeleteRecord(
+            hash: Self.readUInt64(from: data, at: offset),
+            start: Int(Self.readUInt32(from: data, at: offset + 8)),
+            count: Int(Self.readUInt32(from: data, at: offset + 12))
+        )
+    }
+
+    private func deleteCandidateID(at index: Int) -> Int {
+        Int(Self.readUInt32(from: data, at: deleteCandidateIDsOffset + index * Self.candidateIDByteCount))
     }
 
     private static func deletionKeys(for word: String, maxDeletes: Int) -> Set<String> {
@@ -260,66 +333,32 @@ final class AtlasCompiledAutocorrectLexicon {
         }
         return hash
     }
-}
 
-private struct BinaryReader {
-    private let data: Data
-    private var offset = 0
-
-    init(data: Data) {
-        self.data = data
+    private static func checkedOffset(_ base: Int, adding count: Int, stride: Int) throws -> Int {
+        let (byteCount, multiplicationOverflow) = count.multipliedReportingOverflow(by: stride)
+        let (result, additionOverflow) = base.addingReportingOverflow(byteCount)
+        guard !multiplicationOverflow, !additionOverflow else {
+            throw LoadError.invalidFormat("section size overflow")
+        }
+        return result
     }
 
-    mutating func readBytes(count: Int) throws -> [UInt8] {
-        guard count >= 0, offset + count <= data.count else {
-            throw AtlasCompiledAutocorrectLexicon.LoadError.invalidFormat("unexpected end of file")
-        }
-        defer { offset += count }
-        return Array(data[offset..<(offset + count)])
+    private static func readUInt16(from data: Data, at offset: Int) -> UInt16 {
+        UInt16(data[offset]) | (UInt16(data[offset + 1]) << 8)
     }
 
-    mutating func readUInt16() throws -> UInt16 {
-        guard offset + 2 <= data.count else {
-            throw AtlasCompiledAutocorrectLexicon.LoadError.invalidFormat("unexpected end of file")
-        }
-        let value = UInt16(data[offset]) | (UInt16(data[offset + 1]) << 8)
-        offset += 2
-        return value
-    }
-
-    mutating func readUInt32() throws -> UInt32 {
-        guard offset + 4 <= data.count else {
-            throw AtlasCompiledAutocorrectLexicon.LoadError.invalidFormat("unexpected end of file")
-        }
-        let value = UInt32(data[offset])
+    private static func readUInt32(from data: Data, at offset: Int) -> UInt32 {
+        UInt32(data[offset])
             | (UInt32(data[offset + 1]) << 8)
             | (UInt32(data[offset + 2]) << 16)
             | (UInt32(data[offset + 3]) << 24)
-        offset += 4
-        return value
     }
 
-    mutating func readUInt64() throws -> UInt64 {
-        guard offset + 8 <= data.count else {
-            throw AtlasCompiledAutocorrectLexicon.LoadError.invalidFormat("unexpected end of file")
-        }
+    private static func readUInt64(from data: Data, at offset: Int) -> UInt64 {
         var value: UInt64 = 0
         for index in 0..<8 {
             value |= UInt64(data[offset + index]) << UInt64(index * 8)
         }
-        offset += 8
         return value
-    }
-
-    mutating func readFloat32() throws -> Float {
-        Float(bitPattern: try readUInt32())
-    }
-
-    mutating func readCount(_ name: String) throws -> Int {
-        let value = try readUInt32()
-        guard let count = Int(exactly: value) else {
-            throw AtlasCompiledAutocorrectLexicon.LoadError.invalidFormat("\(name) too large")
-        }
-        return count
     }
 }

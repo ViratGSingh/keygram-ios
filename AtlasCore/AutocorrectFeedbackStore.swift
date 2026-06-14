@@ -1,6 +1,8 @@
 import Foundation
 
 struct AutocorrectFeedbackSnapshot: Equatable {
+    private static let suppressionRejectionCount = 3
+
     var accepted: [String: [String: Int]] = [:]
     var rejected: [String: [String: Int]] = [:]
     var contextAccepted: [String: [String: Int]] = [:]
@@ -15,6 +17,24 @@ struct AutocorrectFeedbackSnapshot: Equatable {
 
     func contextAcceptedCount(contextKey: String, typed: String, candidate: String) -> Int {
         contextAccepted[Self.contextMapKey(contextKey: contextKey, typed: typed)]?[candidate] ?? 0
+    }
+
+    func shouldSuppressCorrection(typed: String, candidate: String) -> Bool {
+        rejectedCount(typed: typed, candidate: candidate) >= Self.suppressionRejectionCount
+    }
+
+    func ignoringOneRejection(typed: String, candidate: String) -> AutocorrectFeedbackSnapshot {
+        var adjusted = self
+        let count = adjusted.rejected[typed]?[candidate] ?? 0
+        if count <= 1 {
+            adjusted.rejected[typed]?[candidate] = nil
+            if adjusted.rejected[typed]?.isEmpty == true {
+                adjusted.rejected[typed] = nil
+            }
+        } else {
+            adjusted.rejected[typed]?[candidate] = count - 1
+        }
+        return adjusted
     }
 
     static func contextMapKey(contextKey: String, typed: String) -> String {
@@ -58,12 +78,14 @@ final class AutocorrectFeedbackStore {
     }
 
     func snapshot() -> AutocorrectFeedbackSnapshot {
-        let state = loadState()
-        return AutocorrectFeedbackSnapshot(
-            accepted: state.accepted.mapValues { $0.mapValues(\.count) },
-            rejected: state.rejected.mapValues { $0.mapValues(\.count) },
-            contextAccepted: state.contextAccepted.mapValues { $0.mapValues(\.count) }
-        )
+        queue.sync {
+            let state = loadState()
+            return AutocorrectFeedbackSnapshot(
+                accepted: state.accepted.mapValues { $0.mapValues(\.count) },
+                rejected: state.rejected.mapValues { $0.mapValues(\.count) },
+                contextAccepted: state.contextAccepted.mapValues { $0.mapValues(\.count) }
+            )
+        }
     }
 
     func recordAccepted(typed: String, correction: String, contextKey: String) {
@@ -88,35 +110,37 @@ final class AutocorrectFeedbackStore {
     }
 
     func summaries(limit: Int = 50) -> [AutocorrectFeedbackSummary] {
-        let state = loadState()
-        var rows: [AutocorrectFeedbackSummary] = []
-        for (typed, candidates) in state.accepted {
-            for (candidate, entry) in candidates {
-                rows.append(
-                    AutocorrectFeedbackSummary(
-                        typed: typed,
-                        candidate: candidate,
-                        acceptedCount: entry.count,
-                        rejectedCount: state.rejected[typed]?[candidate]?.count ?? 0,
-                        lastSeenAt: entry.lastSeenAt
+        queue.sync {
+            let state = loadState()
+            var rows: [AutocorrectFeedbackSummary] = []
+            for (typed, candidates) in state.accepted {
+                for (candidate, entry) in candidates {
+                    rows.append(
+                        AutocorrectFeedbackSummary(
+                            typed: typed,
+                            candidate: candidate,
+                            acceptedCount: entry.count,
+                            rejectedCount: state.rejected[typed]?[candidate]?.count ?? 0,
+                            lastSeenAt: entry.lastSeenAt
+                        )
                     )
-                )
+                }
             }
-        }
-        for (typed, candidates) in state.rejected {
-            for (candidate, entry) in candidates where state.accepted[typed]?[candidate] == nil {
-                rows.append(
-                    AutocorrectFeedbackSummary(
-                        typed: typed,
-                        candidate: candidate,
-                        acceptedCount: 0,
-                        rejectedCount: entry.count,
-                        lastSeenAt: entry.lastSeenAt
+            for (typed, candidates) in state.rejected {
+                for (candidate, entry) in candidates where state.accepted[typed]?[candidate] == nil {
+                    rows.append(
+                        AutocorrectFeedbackSummary(
+                            typed: typed,
+                            candidate: candidate,
+                            acceptedCount: 0,
+                            rejectedCount: entry.count,
+                            lastSeenAt: entry.lastSeenAt
+                        )
                     )
-                )
+                }
             }
+            return Array(rows.sorted { $0.lastSeenAt > $1.lastSeenAt }.prefix(limit))
         }
-        return Array(rows.sorted { $0.lastSeenAt > $1.lastSeenAt }.prefix(limit))
     }
 
     func reset() {

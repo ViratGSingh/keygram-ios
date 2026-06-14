@@ -5,12 +5,26 @@ protocol AtlasTokenizing {
     func candidateScores(from logits: [Float], limit: Int) -> [String: Double]
     func vocabularyWords() -> [String]
     func tokenIDs(forWord word: String) -> [Int]
+    func candidateScores(from logits: [Float], candidates: [String]) -> [String: Double]
     func resetTokenizationState()
 }
 
 extension AtlasTokenizing {
     func tokenIDs(forWord word: String) -> [Int] {
         []
+    }
+
+    func candidateScores(from logits: [Float], candidates: [String]) -> [String: Double] {
+        var scores: [String: Double] = [:]
+        for candidate in candidates {
+            guard let firstTokenID = tokenIDs(forWord: candidate).first,
+                  logits.indices.contains(firstTokenID)
+            else {
+                continue
+            }
+            scores[candidate] = Double(logits[firstTokenID])
+        }
+        return scores
     }
 
     func resetTokenizationState() {}
@@ -48,6 +62,27 @@ final class AtlasVocabularyIndex {
     let diagnosticsDescription: String
 
     init(bundle: Bundle = .main, extraWords: [String] = []) {
+        let overlayWords = EngramNormalizer.commonWordsForAutocorrect.map { $0.lowercased() }
+            + extraWords.map { $0.lowercased() }
+
+        if let compiled = try? AtlasCompiledAutocorrectLexicon(bundle: bundle) {
+            let ranked = compiled.rankedCandidates(limit: AtlasConfiguration.suggestionVocabularyLimit)
+            let rankedWords = ranked.map(\.word)
+            let frequencyByWord = Dictionary(uniqueKeysWithValues: ranked.map { ($0.word, $0.frequency) })
+            let mergedWords = Self.orderedUnique(rankedWords + overlayWords)
+            let maxFrequency = ranked.map(\.frequency).max() ?? Double(max(mergedWords.count, 1))
+
+            words = mergedWords
+            fallbackScoresByWord = Dictionary(
+                uniqueKeysWithValues: mergedWords.enumerated().map { index, word in
+                    let rawScore = frequencyByWord[word] ?? Double(max(mergedWords.count - index, 1))
+                    return (word, max(0.05, min(1.0, rawScore / maxFrequency)))
+                }
+            )
+            diagnosticsDescription = "source=compiled autocorrect lexicon limit=\(AtlasConfiguration.suggestionVocabularyLimit) words=\(mergedWords.count); tokenizerOverlay=\(extraWords.count)"
+            return
+        }
+
         let frequencyTable = AtlasAutocorrectDataLoader.loadFrequencyTable(named: "frequency_table", bundle: bundle)
         let frequencyTableIsValid = frequencyTable.map(AtlasAutocorrectDataLoader.isPlausibleFrequencyTable) ?? false
         let importedWords = AtlasAutocorrectDataLoader.loadWordList(named: "english_words", bundle: bundle) ?? []
@@ -71,8 +106,6 @@ final class AtlasVocabularyIndex {
             frequencyStatus = "missing; fallback=english_words order"
         }
 
-        let overlayWords = EngramNormalizer.commonWordsForAutocorrect.map { $0.lowercased() }
-            + extraWords.map { $0.lowercased() }
         let merged = Self.orderedUnique(rankedDictionaryWords + overlayWords)
         let mergedWords = merged
         words = mergedWords

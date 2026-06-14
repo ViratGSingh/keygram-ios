@@ -36,12 +36,39 @@ struct ContentView: View {
     @State private var learnedTypingTaps = Self.loadLearnedTypingTaps()
     @State private var typingModelHealth = Self.loadTypingModelHealth()
     @State private var showingSignOutPlaceholder = false
+    @State private var setupStatus = KeyboardSetupStatus.current()
+    @State private var hasFinishedOnboarding = KeyboardSetupStatus.hasCompletedOnboarding
 
     private var userSession: AtlasSession {
         sessions.first ?? .fresh(name: AtlasSession.defaultName)
     }
 
+    private var shouldShowOnboarding: Bool {
+        !hasFinishedOnboarding && !setupStatus.isComplete
+    }
+
     var body: some View {
+        Group {
+            if shouldShowOnboarding {
+                OnboardingView(
+                    status: setupStatus,
+                    refresh: { setupStatus = KeyboardSetupStatus.current() },
+                    onComplete: {
+                        hasFinishedOnboarding = true
+                        refreshLocalState()
+                    }
+                )
+            } else {
+                homeContent
+            }
+        }
+        .onChange(of: scenePhase) { _, newValue in
+            guard newValue == .active else { return }
+            setupStatus = KeyboardSetupStatus.current()
+        }
+    }
+
+    private var homeContent: some View {
         NavigationStack {
             HomeView(
                 signOutAction: {
@@ -69,6 +96,7 @@ struct ContentView: View {
                 personaWords: {
                     PersonaWordsView(
                         session: userSession,
+                        confirmWord: confirmEngramWord,
                         removeWord: removeEngramWord
                     )
                 },
@@ -111,6 +139,13 @@ struct ContentView: View {
     private func removeEngramWord(_ entry: EngramEntry) {
         guard var session = sessions.first else { return }
         session.engram.remove(entry.word)
+        session.updatedAt = Date()
+        sessions = [session]
+    }
+
+    private func confirmEngramWord(_ entry: EngramEntry) {
+        guard var session = sessions.first else { return }
+        session.engram.confirmManually(entry.word, sessionName: session.name)
         session.updatedAt = Date()
         sessions = [session]
     }
@@ -204,11 +239,11 @@ private struct HomeView<KeyboardSettings: View, TypingPersonalization: View, Per
 
                 VStack(spacing: metrics.sectionSpacing) {
                     HomeSection {
-                        HomeNavigationRow("Keyboard Setup", rowHeight: metrics.rowHeight) {
-                            KeyboardSetupView()
-                        }
-                        HomeDivider()
-                        HomeNavigationRow("Keyboard Settings", rowHeight: metrics.rowHeight) {
+//                        HomeNavigationRow("Keyboard Setup", rowHeight: metrics.rowHeight) {
+//                            KeyboardSetupView()
+//                        }
+//                        HomeDivider()
+                        HomeNavigationRow("Settings", rowHeight: metrics.rowHeight) {
                             keyboardSettings()
                         }
                         HomeDivider()
@@ -223,10 +258,10 @@ private struct HomeView<KeyboardSettings: View, TypingPersonalization: View, Per
                         HomeNavigationRow("Corrections", rowHeight: metrics.rowHeight) {
                             learnedCorrections()
                         }
-                        HomeDivider()
-                        HomeNavigationRow("Stickers", rowHeight: metrics.rowHeight) {
-                            StickersView()
-                        }
+//                        HomeDivider()
+//                        HomeNavigationRow("Stickers", rowHeight: metrics.rowHeight) {
+//                            StickersView()
+//                        }
                     }
 
                     HomeSection {
@@ -255,14 +290,14 @@ private struct HomeView<KeyboardSettings: View, TypingPersonalization: View, Per
                         }
                     }
 
-                    HomeSection {
-                        HomeButtonRow(
-                            "Sign out",
-                            role: .destructive,
-                            rowHeight: metrics.rowHeight,
-                            action: signOutAction
-                        )
-                    }
+//                    HomeSection {
+//                        HomeButtonRow(
+//                            "Sign out",
+//                            role: .destructive,
+//                            rowHeight: metrics.rowHeight,
+//                            action: signOutAction
+//                        )
+//                    }
                 }
             }
             .padding(.top, metrics.topPadding)
@@ -292,8 +327,8 @@ private struct HomeLayoutMetrics {
         sectionSpacing = min(18, max(8, height * 0.016))
         heroSectionSpacing = min(120, max(60, height * 0.026))
 
-        let rowCount: CGFloat = 10
-        let outerSpacing = heroSectionSpacing + sectionSpacing * 2
+        let rowCount: CGFloat = 7
+        let outerSpacing = heroSectionSpacing + sectionSpacing
         let preferredHeroHeight = min(109, max(70, height * 0.12))
         let rowHeightWithPreferredHero = (
             height - topPadding - bottomPadding - outerSpacing - preferredHeroHeight - dividerHeight
@@ -323,41 +358,22 @@ private struct KeyboardHero: View {
     var height: CGFloat
     var logoSize: CGFloat
 
-    private let icons: [(String, CGFloat, CGFloat)] = [
-        ("briefcase.fill", -130, -64),
-        ("airplane", -22, -70),
-        ("heart.fill", 92, -62),
-        ("photo.fill", 176, -62),
-        ("play.fill", -86, -18),
-        ("arrow.left.arrow.right.square.fill", 144, 10),
-        ("car.fill", -154, 64),
-        ("mappin", -92, 72),
-        ("mic.fill", 114, 74),
-        ("calendar", 178, 72),
-        ("person.fill", -132, 134),
-        ("clock", -52, 132),
-        ("star.square.fill", 108, 134),
-        ("house.fill", 168, 132)
-    ]
-
     var body: some View {
         let iconScale = max(0.58, min(1, height / 250))
 
-        ZStack {
-            ForEach(Array(icons.enumerated()), id: \.offset) { _, icon in
-                Image(systemName: icon.0)
-                    .font(.system(size: 24 * iconScale, weight: .semibold))
-                    .foregroundStyle(.secondary.opacity(0.13))
-                    .offset(x: icon.1 * iconScale, y: icon.2 * iconScale)
+        Group {
+            if let logoURL = Bundle.main.url(
+                forResource: "AppIcon~ios-marketing",
+                withExtension: "png"
+            ), let logo = UIImage(contentsOfFile: logoURL.path) {
+                Image(uiImage: logo)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: logoSize, height: logoSize)
+                    .clipShape(RoundedRectangle(cornerRadius: logoSize * 0.18, style: .continuous))
+                    .shadow(color: .black.opacity(0.08), radius: 8, y: 4)
+                    .offset(y: 12 * iconScale)
             }
-
-            Image("Logo")
-                .resizable()
-                .scaledToFit()
-                .frame(width: logoSize, height: logoSize)
-                .clipShape(RoundedRectangle(cornerRadius: logoSize * 0.18, style: .continuous))
-                .shadow(color: .black.opacity(0.08), radius: 8, y: 4)
-                .offset(y: 12 * iconScale)
         }
         .frame(maxWidth: .infinity)
     }
@@ -504,13 +520,19 @@ private struct KeyboardSettingsView: View {
     @Binding var personalizedAutocorrectEnabled: Bool
     @Binding var learnNewWordsEnabled: Bool
     @Binding var darkKeyboardEnabled: Bool
+    private let enabledTint = Color(
+        red: 246.0 / 255.0,
+        green: 207.0 / 255.0,
+        blue: 47.0 / 255.0
+    )
 
     var body: some View {
         Form {
-            Section("Keyboard") {
+            Section {
+//                Text("Keyboard")
                 Toggle("Haptics", isOn: $hapticsEnabled)
                 Toggle("Autocorrect", isOn: $autocorrectEnabled)
-                Toggle("AI Rewrite", isOn: $aiRewriteEnabled)
+//                Toggle("AI Rewrite", isOn: $aiRewriteEnabled)
                 Toggle("Personalized autocorrect", isOn: $personalizedAutocorrectEnabled)
                 Toggle("Learn new words", isOn: $learnNewWordsEnabled)
                 Toggle("Dark keyboard", isOn: $darkKeyboardEnabled)
@@ -522,13 +544,14 @@ private struct KeyboardSettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Section("AI Rewrite Privacy") {
-                Text("AI Rewrite sends only the selected text or current message you submit for rewriting to OpenRouter. Normal typing stays on this device.")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-            }
+//            Section("AI Rewrite Privacy") {
+//                Text("AI Rewrite sends only the selected text or current message you submit for rewriting to OpenRouter. Normal typing stays on this device.")
+//                    .font(.subheadline)
+//                    .foregroundStyle(.secondary)
+//            }
         }
-        .navigationTitle("Keyboard Settings")
+        .tint(enabledTint)
+        .navigationTitle("Settings")
     }
 }
 
@@ -556,7 +579,8 @@ private struct TypingPersonalizationView: View {
 
     var body: some View {
         List {
-            Section("Personalized Typing") {
+            Section {
+//                Text("Personalized Typing")
                 HStack(alignment: .top, spacing: 14) {
                     Image(systemName: isReady ? "checkmark.circle.fill" : "keyboard.badge.ellipsis")
                         .font(.title2)
@@ -614,6 +638,13 @@ private struct TypingPersonalizationView: View {
                 }
             }
         }
+        .tint(
+            Color(
+                red: 246.0 / 255.0,
+                green: 207.0 / 255.0,
+                blue: 47.0 / 255.0
+            )
+        )
         .navigationTitle("Typing")
         .refreshable {
             refresh()
@@ -644,6 +675,7 @@ private struct TypingPersonalizationView: View {
 
 private struct PersonaWordsView: View {
     var session: AtlasSession
+    var confirmWord: (EngramEntry) -> Void
     var removeWord: (EngramEntry) -> Void
     @State private var searchText = ""
     private let recentWordLimit = 10
@@ -711,7 +743,12 @@ private struct PersonaWordsView: View {
                         )
                     } else {
                         ForEach(recentConfirmedEntries) { entry in
-                            RemovableEngramWordRow(entry: entry, maxCount: maxAcceptedCount, removeWord: removeWord)
+                            RemovableEngramWordRow(
+                                entry: entry,
+                                maxCount: maxAcceptedCount,
+                                confirmWord: confirmWord,
+                                removeWord: removeWord
+                            )
                         }
                     }
                 }
@@ -719,7 +756,12 @@ private struct PersonaWordsView: View {
                 if !recentProvisionalEntries.isEmpty {
                     Section("Recent Provisional Words") {
                         ForEach(recentProvisionalEntries) { entry in
-                            RemovableEngramWordRow(entry: entry, maxCount: maxAcceptedCount, removeWord: removeWord)
+                            RemovableEngramWordRow(
+                                entry: entry,
+                                maxCount: maxAcceptedCount,
+                                confirmWord: confirmWord,
+                                removeWord: removeWord
+                            )
                         }
                     }
                 }
@@ -729,7 +771,12 @@ private struct PersonaWordsView: View {
                     ContentUnavailableView.search(text: trimmedSearchText)
                     } else {
                         ForEach(searchResults) { entry in
-                            RemovableEngramWordRow(entry: entry, maxCount: maxAcceptedCount, removeWord: removeWord)
+                            RemovableEngramWordRow(
+                                entry: entry,
+                                maxCount: maxAcceptedCount,
+                                confirmWord: confirmWord,
+                                removeWord: removeWord
+                            )
                         }
                     }
                 }
@@ -747,11 +794,24 @@ private struct PersonaWordsView: View {
 private struct RemovableEngramWordRow: View {
     var entry: EngramEntry
     var maxCount: Int
+    var confirmWord: (EngramEntry) -> Void
     var removeWord: (EngramEntry) -> Void
 
     var body: some View {
         HStack(alignment: .center, spacing: 12) {
             EngramWordRow(entry: entry, maxCount: maxCount)
+
+            if !entry.isConfirmed {
+                Button {
+                    confirmWord(entry)
+                } label: {
+                    Image(systemName: "checkmark.circle")
+                        .font(.body.weight(.semibold))
+                        .frame(width: 36, height: 36)
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Confirm \(entry.word)")
+            }
 
             Button(role: .destructive) {
                 removeWord(entry)
@@ -764,6 +824,14 @@ private struct RemovableEngramWordRow: View {
             .accessibilityLabel("Delete \(entry.word)")
         }
         .swipeActions {
+            if !entry.isConfirmed {
+                Button {
+                    confirmWord(entry)
+                } label: {
+                    Label("Confirm", systemImage: "checkmark.circle")
+                }
+                .tint(.green)
+            }
             Button(role: .destructive) {
                 removeWord(entry)
             } label: {
@@ -771,6 +839,13 @@ private struct RemovableEngramWordRow: View {
             }
         }
         .contextMenu {
+            if !entry.isConfirmed {
+                Button {
+                    confirmWord(entry)
+                } label: {
+                    Label("Confirm", systemImage: "checkmark.circle")
+                }
+            }
             Button(role: .destructive) {
                 removeWord(entry)
             } label: {
