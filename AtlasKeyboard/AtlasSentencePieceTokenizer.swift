@@ -24,14 +24,15 @@ final class AtlasSentencePieceTokenizer: AtlasTokenizing {
     }
 
     func candidateScores(from logits: [Float], limit: Int) -> [String: Double] {
-        let ranked = logits.indices
-            .sorted { logits[$0] > logits[$1] }
-            .prefix(limit)
+        let ranked = logits.indices.sorted { logits[$0] > logits[$1] }
 
         var scores: [String: Double] = [:]
         for index in ranked {
             guard let word = displayWord(forTokenID: index, requireWordBoundary: true) else { continue }
             scores[word] = max(scores[word] ?? -.infinity, Double(logits[index]))
+            if scores.count == limit {
+                break
+            }
         }
         return scores
     }
@@ -49,6 +50,12 @@ final class AtlasSentencePieceTokenizer: AtlasTokenizing {
         let normalized = word.trimmingCharacters(in: CharacterSet.alphanumerics.inverted).lowercased()
         guard !normalized.isEmpty else { return [] }
         return (try? tokenizer.encode(" " + normalized).map { Int($0) }) ?? []
+    }
+
+    func tokenPiece(forTokenID tokenID: Int) -> String? {
+        guard let token = try? tokenizer.idToToken(tokenID) else { return nil }
+        guard !token.hasPrefix("<"), !token.hasSuffix(">") else { return nil }
+        return token
     }
 
     func resetTokenizationState() {
@@ -93,6 +100,10 @@ final class AtlasSentencePieceTokenizer: AtlasTokenizing {
 
     func tokenIDs(forWord word: String) -> [Int] {
         fallback.tokenIDs(forWord: word)
+    }
+
+    func tokenPiece(forTokenID tokenID: Int) -> String? {
+        fallback.tokenPiece(forTokenID: tokenID)
     }
 
     func resetTokenizationState() {

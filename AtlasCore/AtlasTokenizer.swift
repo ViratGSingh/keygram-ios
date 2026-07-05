@@ -5,6 +5,7 @@ protocol AtlasTokenizing {
     func candidateScores(from logits: [Float], limit: Int) -> [String: Double]
     func vocabularyWords() -> [String]
     func tokenIDs(forWord word: String) -> [Int]
+    func tokenPiece(forTokenID tokenID: Int) -> String?
     func candidateScores(from logits: [Float], candidates: [String]) -> [String: Double]
     func resetTokenizationState()
 }
@@ -12,6 +13,10 @@ protocol AtlasTokenizing {
 extension AtlasTokenizing {
     func tokenIDs(forWord word: String) -> [Int] {
         []
+    }
+
+    func tokenPiece(forTokenID tokenID: Int) -> String? {
+        nil
     }
 
     func candidateScores(from logits: [Float], candidates: [String]) -> [String: Double] {
@@ -58,7 +63,9 @@ final class AtlasTokenizer: AtlasTokenizing {
 
 final class AtlasVocabularyIndex {
     private let words: [String]
+    private let wordSet: Set<String>
     private let fallbackScoresByWord: [String: Double]
+    private let fallbackProbabilitiesByWord: [String: Double]
     let diagnosticsDescription: String
 
     init(bundle: Bundle = .main, extraWords: [String] = []) {
@@ -71,12 +78,25 @@ final class AtlasVocabularyIndex {
             let frequencyByWord = Dictionary(uniqueKeysWithValues: ranked.map { ($0.word, $0.frequency) })
             let mergedWords = Self.orderedUnique(rankedWords + overlayWords)
             let maxFrequency = ranked.map(\.frequency).max() ?? Double(max(mergedWords.count, 1))
-
-            words = mergedWords
-            fallbackScoresByWord = Dictionary(
+            let rawScores = Dictionary(
                 uniqueKeysWithValues: mergedWords.enumerated().map { index, word in
                     let rawScore = frequencyByWord[word] ?? Double(max(mergedWords.count - index, 1))
+                    return (word, max(rawScore, 1))
+                }
+            )
+            let totalFrequency = max(rawScores.values.reduce(0, +), 1)
+
+            words = mergedWords
+            wordSet = Set(mergedWords)
+            fallbackScoresByWord = Dictionary(
+                uniqueKeysWithValues: mergedWords.map { word in
+                    let rawScore = rawScores[word] ?? 1
                     return (word, max(0.05, min(1.0, rawScore / maxFrequency)))
+                }
+            )
+            fallbackProbabilitiesByWord = Dictionary(
+                uniqueKeysWithValues: mergedWords.map { word in
+                    (word, (rawScores[word] ?? 1) / totalFrequency)
                 }
             )
             diagnosticsDescription = "source=compiled autocorrect lexicon limit=\(AtlasConfiguration.suggestionVocabularyLimit) words=\(mergedWords.count); tokenizerOverlay=\(extraWords.count)"
@@ -109,13 +129,26 @@ final class AtlasVocabularyIndex {
         let merged = Self.orderedUnique(rankedDictionaryWords + overlayWords)
         let mergedWords = merged
         words = mergedWords
+        wordSet = Set(mergedWords)
 
         let maxFrequency = frequencyTable?.values.max() ?? Double(max(mergedWords.count, 1))
-        fallbackScoresByWord = Dictionary(
+        let rawScores = Dictionary(
             uniqueKeysWithValues: mergedWords.enumerated().map { index, word in
                 let rawScore = frequencyTable?[word] ?? Double(max(mergedWords.count - index, 1))
+                return (word, max(rawScore, 1))
+            }
+        )
+        let totalFrequency = max(rawScores.values.reduce(0, +), 1)
+        fallbackScoresByWord = Dictionary(
+            uniqueKeysWithValues: mergedWords.map { word in
+                let rawScore = rawScores[word] ?? 1
                 let score = max(0.05, min(1.0, rawScore / maxFrequency))
                 return (word, score)
+            }
+        )
+        fallbackProbabilitiesByWord = Dictionary(
+            uniqueKeysWithValues: mergedWords.map { word in
+                (word, (rawScores[word] ?? 1) / totalFrequency)
             }
         )
         diagnosticsDescription = "source=frequency-ranked english_words.bin limit=\(AtlasConfiguration.suggestionVocabularyLimit) words=\(mergedWords.count); frequency_table.bin \(frequencyStatus); tokenizerOverlay=\(extraWords.count)"
@@ -139,7 +172,7 @@ final class AtlasVocabularyIndex {
     }
 
     func contains(_ word: String) -> Bool {
-        words.contains(word.lowercased())
+        wordSet.contains(word.lowercased())
     }
 
     func allWords() -> [String] {
@@ -152,6 +185,11 @@ final class AtlasVocabularyIndex {
                 fallbackScoresByWord[word].map { (word, $0) }
             }
         )
+    }
+
+    func frequencyProbability(for word: String) -> Double {
+        fallbackProbabilitiesByWord[word.lowercased()]
+            ?? 1.0 / Double(max(words.count * 20, 1))
     }
 
     private static func orderedUnique(_ words: [String]) -> [String] {

@@ -6,6 +6,7 @@ protocol KeyboardSurfaceViewDelegate: AnyObject {
     func keyboardSurfaceView(_ view: KeyboardSurfaceView, preferredHeightDidChange height: CGFloat)
     func keyboardSurfaceViewDidLongPressBackspace(_ view: KeyboardSurfaceView)
     func keyboardSurfaceViewDidLongPressSession(_ view: KeyboardSurfaceView)
+    func keyboardSurfaceView(_ view: KeyboardSurfaceView, didRequestForgetPersonalWord word: String)
     func keyboardSurfaceViewDidRequestDismissKeyboard(_ view: KeyboardSurfaceView)
     func keyboardSurfaceView(_ view: KeyboardSurfaceView, didSetHapticsEnabled enabled: Bool)
     func keyboardSurfaceViewDidTapClipboard(_ view: KeyboardSurfaceView)
@@ -52,8 +53,8 @@ final class KeyboardSurfaceView: UIView {
         // Suggestion bar is slimmer than a key row, matching the iOS system keyboard.
         static let toolbarHeight: CGFloat = 38
         static let rowHeight: CGFloat = 52
-        // 1 toolbar + 4 key rows + a little vertical slack.
-        static let keyboardContentHeight: CGFloat = toolbarHeight + rowHeight * 4 + 8
+        // 1 toolbar + 4 key rows. Avoid extra vertical slack so every key row stays equal.
+        static let keyboardContentHeight: CGFloat = toolbarHeight + rowHeight * 4
         // Normal emoji mode stays the same height as the regular keyboard.
         static let emojiContentHeight: CGFloat = keyboardContentHeight
         static let emojiSearchStackSpacing: CGFloat = 6
@@ -77,6 +78,13 @@ final class KeyboardSurfaceView: UIView {
             + emojiSearchStackSpacing * 4
         static let buttonHorizontalInset: CGFloat = 3
         static let buttonVerticalInset: CGFloat = 4
+        /// Keep a tiny gap between an edge key's extended touch target and a real
+        /// neighbouring key so a deliberate tap on the neighbour is never stolen.
+        static let edgeKeyReachGuard: CGFloat = 2
+    }
+
+    private enum SuggestionStyle {
+        static let personalizedAccent = UIColor(red: 246 / 255, green: 208 / 255, blue: 46 / 255, alpha: 1)
     }
 
     static var keyboardBackgroundColor: UIColor {
@@ -106,8 +114,15 @@ final class KeyboardSurfaceView: UIView {
     private let menuOverlay = UIView()
     private var suggestionRowHeightConstraint: NSLayoutConstraint?
     private var keyRowHeightConstraints: [NSLayoutConstraint] = []
+    private var keyButtonHeightConstraints: [NSLayoutConstraint] = []
     private var suggestionButtons: [UIButton] = []
+    private let chipsContainer = UIStackView()
+    private var fullAccessPromptButton: UIButton!
     private var keyButtons: [KeyboardButton] = []
+    /// Letter keys at a row's left/right end that border dead space (a spacer or the
+    /// screen edge). Their touch targets are stretched outward in `updateEdgeReachOutsets`
+    /// so reach-misses for edge keys like "a" still register.
+    private var edgeReachButtons: [(button: KeyboardButton, extendLeft: Bool, extendRight: Bool)] = []
     private var menuButtons: [UIButton] = []
     private var sessionButton: UIButton!
     private var personaPicker: UIScrollView!
@@ -121,6 +136,7 @@ final class KeyboardSurfaceView: UIView {
     private var rewriteDisclosureCancelButton: UIButton?
     private var hapticsToggleButton: UIButton?
     private var keyPreviewView: UIView?
+    private var forgetDialogOverlay: UIView?
     private var suggestionSeparatorLayers: [CALayer] = []
     private var touchStartTimes: [ObjectIdentifier: CFTimeInterval] = [:]
     private var isPersonaPickerOpen = false
@@ -224,6 +240,7 @@ final class KeyboardSurfaceView: UIView {
         updateRowHeights(for: contentHeight)
         rootStack.setNeedsLayout()
         rootStack.layoutIfNeeded()
+        updateEdgeReachOutsets()
         updateSuggestionSeparators()
 
         // The menu overlay covers the key area beneath the toolbar slot.
@@ -257,6 +274,8 @@ final class KeyboardSurfaceView: UIView {
         backspaceTimer = nil
         keyPreviewView?.removeFromSuperview()
         keyPreviewView = nil
+        forgetDialogOverlay?.removeFromSuperview()
+        forgetDialogOverlay = nil
         isPersonaPickerOpen = false
         personaPicker?.alpha = 0
         personaPicker?.isHidden = true
@@ -272,20 +291,67 @@ final class KeyboardSurfaceView: UIView {
     }
 
     func setSuggestions(_ suggestions: [AtlasSuggestion]) {
+        setFullAccessPromptVisible(false)
+        let displaySuggestions = centeredPersonalSuggestionOrder(suggestions)
+        let centerIndexForSingleSuggestion = suggestionButtons.count / 2
         for (index, button) in suggestionButtons.enumerated() {
-            if index < suggestions.count {
-                let suggestion = suggestions[index]
+            let suggestion: AtlasSuggestion?
+            if displaySuggestions.count == 1, suggestionButtons.indices.contains(centerIndexForSingleSuggestion) {
+                suggestion = index == centerIndexForSingleSuggestion ? displaySuggestions[0] : nil
+            } else if index < displaySuggestions.count {
+                suggestion = displaySuggestions[index]
+            } else {
+                suggestion = nil
+            }
+
+            if let suggestion {
                 setSuggestionTitle(suggestion.text, for: button)
                 button.accessibilityIdentifier = suggestion.kind.rawValue
+                applySuggestionStyle(suggestion.kind, to: button)
                 button.isEnabled = true
                 button.alpha = 1
             } else {
                 setSuggestionTitle("", for: button)
+                button.accessibilityIdentifier = nil
+                applySuggestionStyle(nil, to: button)
                 button.isEnabled = false
                 button.alpha = 0.4
             }
         }
         updateSuggestionSeparators()
+    }
+
+    private func centeredPersonalSuggestionOrder(_ suggestions: [AtlasSuggestion]) -> [AtlasSuggestion] {
+        guard suggestions.count == suggestionButtons.count,
+              suggestionButtons.count == 3,
+              let personal = suggestions.first(where: { $0.kind == .personal }),
+              suggestions.filter({ $0.kind == .personal }).count == 1
+        else {
+            return suggestions
+        }
+
+        let nonPersonal = suggestions.filter { $0.kind != .personal }
+        guard nonPersonal.count == 2 else { return suggestions }
+        return [nonPersonal[0], personal, nonPersonal[1]]
+    }
+
+    /// Replaces the autocomplete chips with a full-width call-to-action prompting the
+    /// user to grant Full Access, which the next-word model requires. Tapping it routes
+    /// through the `.enableFullAccess` suggestion so the controller can open Settings.
+    func showFullAccessPrompt(_ message: String) {
+        fullAccessPromptButton.setTitle(message, for: .normal)
+        setFullAccessPromptVisible(true)
+    }
+
+    private func setFullAccessPromptVisible(_ isVisible: Bool) {
+        guard fullAccessPromptButton != nil else { return }
+        fullAccessPromptButton.isHidden = !isVisible
+        chipsContainer.isHidden = isVisible
+        if isVisible {
+            suggestionSeparatorLayers.forEach { $0.isHidden = true }
+        } else {
+            updateSuggestionSeparators()
+        }
     }
 
     func setAIRewriteEnabled(_ isEnabled: Bool) {
@@ -429,7 +495,6 @@ final class KeyboardSurfaceView: UIView {
 
         buildPersonaRail()
 
-        let chipsContainer = UIStackView()
         chipsContainer.axis = .horizontal
         chipsContainer.spacing = 0
         chipsContainer.distribution = .fillEqually
@@ -440,10 +505,20 @@ final class KeyboardSurfaceView: UIView {
             button.addTarget(self, action: #selector(controlTouchDown(_:)), for: .touchDown)
             button.addTarget(self, action: #selector(suggestionTapped(_:)), for: .touchUpInside)
             button.addTarget(self, action: #selector(controlTouchCancelled(_:)), for: [.touchUpOutside, .touchCancel, .touchDragExit])
+            let longPress = UILongPressGestureRecognizer(target: self, action: #selector(suggestionLongPressed(_:)))
+            longPress.minimumPressDuration = 0.4
+            button.addGestureRecognizer(longPress)
             suggestionButtons.append(button)
             chipsContainer.addArrangedSubview(button)
         }
         suggestionStack.addArrangedSubview(chipsContainer)
+
+        fullAccessPromptButton = makeFullAccessPromptButton()
+        fullAccessPromptButton.isHidden = true
+        fullAccessPromptButton.addTarget(self, action: #selector(controlTouchDown(_:)), for: .touchDown)
+        fullAccessPromptButton.addTarget(self, action: #selector(fullAccessPromptTapped), for: .touchUpInside)
+        fullAccessPromptButton.addTarget(self, action: #selector(controlTouchCancelled(_:)), for: [.touchUpOutside, .touchCancel, .touchDragExit])
+        suggestionStack.addArrangedSubview(fullAccessPromptButton)
 
 //        aiRewriteButton = makeToolbarIconButton(systemName: "sparkles", accessibilityLabel: "AI rewrite")
 //        aiRewriteButton.addTarget(self, action: #selector(controlTouchDown(_:)), for: .touchDown)
@@ -617,7 +692,9 @@ final class KeyboardSurfaceView: UIView {
         suggestionStack.isHidden = hideToolbar
         keyStack.spacing = keyboardMode == .emoji ? LayoutMetric.emojiSearchStackSpacing : 0
         keyButtons.removeAll()
+        edgeReachButtons.removeAll()
         keyRowHeightConstraints.removeAll()
+        keyButtonHeightConstraints.removeAll()
         keyStack.arrangedSubviews.forEach { view in
             keyStack.removeArrangedSubview(view)
             view.removeFromSuperview()
@@ -640,8 +717,72 @@ final class KeyboardSurfaceView: UIView {
         setNeedsLayout()
     }
 
+    /// Number inserted when a top-row letter key is long-pressed, mirroring the digit
+    /// that sits above it on the numeric keyboard (q→1, w→2, … o→9, p→0).
+    private static let topRowNumberAlternates: [String: String] = [
+        "q": "1", "w": "2", "e": "3", "r": "4", "t": "5",
+        "y": "6", "u": "7", "i": "8", "o": "9", "p": "0",
+    ]
+
     private func buildLetterRows() {
         renderKeyLayout(letterLayout)
+        attachTopRowNumberLongPress()
+    }
+
+    private func attachTopRowNumberLongPress() {
+        for button in keyButtons {
+            guard case .character(let value) = button.key,
+                  let number = Self.topRowNumberAlternates[value.lowercased()]
+            else { continue }
+            button.longPressCharacter = number
+            addNumberHint(number, to: button)
+            let recognizer = UILongPressGestureRecognizer(
+                target: self,
+                action: #selector(numberKeyLongPressed(_:))
+            )
+            recognizer.minimumPressDuration = 0.3
+            button.addGestureRecognizer(recognizer)
+        }
+    }
+
+    /// Small digit tucked into the key's top-right corner hinting the long-press number.
+    private func addNumberHint(_ number: String, to button: KeyboardButton) {
+        let hint = UILabel()
+        hint.text = number
+        hint.font = .systemFont(ofSize: 11, weight: .regular)
+        hint.textColor = .secondaryLabel
+        hint.textAlignment = .right
+        hint.isUserInteractionEnabled = false
+        hint.translatesAutoresizingMaskIntoConstraints = false
+        button.addSubview(hint)
+        NSLayoutConstraint.activate([
+            hint.trailingAnchor.constraint(equalTo: button.trailingAnchor, constant: -4),
+            hint.topAnchor.constraint(equalTo: button.topAnchor, constant: 2),
+        ])
+    }
+
+    @objc private func numberKeyLongPressed(_ recognizer: UILongPressGestureRecognizer) {
+        guard let button = recognizer.view as? KeyboardButton,
+              let number = button.longPressCharacter
+        else { return }
+
+        switch recognizer.state {
+        case .began:
+            // The gesture cancels the button's touch tracking, so the letter tap won't
+            // also fire; we emit the number and swap the letter popup for the number one.
+            triggerKeyFeedback()
+            let point = button.convert(CGPoint(x: button.bounds.midX, y: button.bounds.midY), to: self)
+            let now = CACurrentMediaTime()
+            delegate?.keyboardSurfaceView(self, didTap: .character(number), at: point, touchStartedAt: now, touchEndedAt: now)
+            // Deferred so it runs after the button's touch-cancel hides the letter popup.
+            DispatchQueue.main.async { [weak self] in
+                self?.showKeyPreview(number, from: button)
+            }
+        case .ended, .cancelled, .failed:
+            hideKeyPreview()
+        default:
+            break
+        }
     }
 
     private func buildEmojiRows() {
@@ -1289,9 +1430,11 @@ final class KeyboardSurfaceView: UIView {
             ],
             [
                 .key(.modeToggle, title: "123", width: .inputPercentage(1.23)),
-                .key(.globe, width: .inputPercentage(1.23)),
+                .key(.globe, width: .inputPercentage(1.27)),
+                .key(.character(","), title: ",", width: .inputPercentage(1.0)),
                 .key(.space, width: .available),
-                .key(.returnKey, width: .percentage(0.25)),
+                .key(.character("."), title: ".", width: .inputPercentage(1.0)),
+                .key(.returnKey, width: .inputPercentage(1.5)),
             ],
         ])
     }
@@ -1350,9 +1493,10 @@ final class KeyboardSurfaceView: UIView {
             [
                 .key(.modeToggle, title: "123", width: .inputPercentage(1.23)),
                 .key(.globe, width: .inputPercentage(1.23)),
+                .key(.character(","), title: ",", width: .inputPercentage(1.0)),
                 .key(.space, width: .available),
                 .key(.character("."), title: ".", width: .inputPercentage(1.0)),
-                .key(.returnKey, width: .percentage(0.25)),
+                .key(.returnKey, width: .inputPercentage(1.4)),
             ],
         ])
     }
@@ -1377,12 +1521,75 @@ final class KeyboardSurfaceView: UIView {
         for itemRow in layout.itemRows {
             let row = keyboardRow()
             let widthMultipliers = resolvedWidthMultipliers(for: itemRow)
-            for (item, widthMultiplier) in zip(itemRow, widthMultipliers) {
-                addLayoutItem(item, to: row, widthMultiplier: widthMultiplier)
+            for index in itemRow.indices {
+                let button = addLayoutItem(itemRow[index], to: row, widthMultiplier: widthMultipliers[index])
+                if let button {
+                    flagEdgeReach(button, at: index, in: itemRow)
+                }
             }
             keyStack.addArrangedSubview(row)
             row.widthAnchor.constraint(equalTo: keyStack.widthAnchor).isActive = true
         }
+    }
+
+    /// Records whether a letter key sits at a row end next to dead space (a spacer or
+    /// the row edge), so `updateEdgeReachOutsets` can stretch its touch target outward.
+    /// Only single-letter keys qualify; a letter flanked by another key (e.g. "," next
+    /// to the globe key on the bottom row) is left alone so it can't swallow that key.
+    private func flagEdgeReach(_ button: KeyboardButton, at index: Int, in itemRow: [KeyLayout.Item]) {
+        guard case .character = button.key else { return }
+        let extendLeft = index == 0 || itemRow[index - 1].key == nil
+        let extendRight = index == itemRow.count - 1 || itemRow[index + 1].key == nil
+        guard extendLeft || extendRight else { return }
+        edgeReachButtons.append((button, extendLeft, extendRight))
+    }
+
+    /// Stretches each flagged edge letter's touch target into the neighbouring dead
+    /// space — out to the screen edge when nothing is beside it, or to the midpoint of
+    /// the gap when a real key (shift/backspace) is the nearest neighbour. Runs after
+    /// layout because the dead-space widths are only known once frames are resolved.
+    private func updateEdgeReachOutsets() {
+        for entry in edgeReachButtons {
+            let button = entry.button
+            guard button.bounds.width > 0 else { continue }
+            let frame = button.convert(button.bounds, to: self)
+            let rowMidY = frame.midY
+
+            if entry.extendLeft {
+                let neighborMaxX = nearestKeyEdgeX(toLeftOf: frame, rowMidY: rowMidY)
+                let boundary = neighborMaxX.map { ($0 + frame.minX) / 2 + LayoutMetric.edgeKeyReachGuard } ?? 0
+                button.hitTestOutsets.left = max(LayoutMetric.buttonHorizontalInset, frame.minX - boundary)
+            }
+            if entry.extendRight {
+                let neighborMinX = nearestKeyEdgeX(toRightOf: frame, rowMidY: rowMidY)
+                let boundary = neighborMinX.map { ($0 + frame.maxX) / 2 - LayoutMetric.edgeKeyReachGuard } ?? bounds.width
+                button.hitTestOutsets.right = max(LayoutMetric.buttonHorizontalInset, boundary - frame.maxX)
+            }
+        }
+    }
+
+    /// Right edge of the closest key entirely to the left of `frame` on the same row.
+    private func nearestKeyEdgeX(toLeftOf frame: CGRect, rowMidY: CGFloat) -> CGFloat? {
+        keyButtons.compactMap { other -> CGFloat? in
+            let otherFrame = other.convert(other.bounds, to: self)
+            guard otherFrame.width > 0,
+                  abs(otherFrame.midY - rowMidY) < otherFrame.height / 2,
+                  otherFrame.maxX <= frame.minX
+            else { return nil }
+            return otherFrame.maxX
+        }.max()
+    }
+
+    /// Left edge of the closest key entirely to the right of `frame` on the same row.
+    private func nearestKeyEdgeX(toRightOf frame: CGRect, rowMidY: CGFloat) -> CGFloat? {
+        keyButtons.compactMap { other -> CGFloat? in
+            let otherFrame = other.convert(other.bounds, to: self)
+            guard otherFrame.width > 0,
+                  abs(otherFrame.midY - rowMidY) < otherFrame.height / 2,
+                  otherFrame.minX >= frame.maxX
+            else { return nil }
+            return otherFrame.minX
+        }.min()
     }
 
     private func resolvedWidthMultipliers(for itemRow: [KeyLayout.Item]) -> [CGFloat?] {
@@ -1442,7 +1649,7 @@ final class KeyboardSurfaceView: UIView {
     }
 
     private func keyboardRow() -> UIStackView {
-        let row = UIStackView()
+        let row = KeyboardRowStackView()
         row.axis = .horizontal
         row.spacing = 0
         row.distribution = .fill
@@ -1462,6 +1669,9 @@ final class KeyboardSurfaceView: UIView {
         let rowHeight = min(LayoutMetric.rowHeight, remaining / CGFloat(keyRows))
         suggestionRowHeightConstraint?.constant = toolbarHeight
         keyRowHeightConstraints.forEach { $0.constant = rowHeight }
+        keyButtonHeightConstraints.forEach {
+            $0.constant = max(0, rowHeight - LayoutMetric.buttonVerticalInset * 2)
+        }
     }
 
     @discardableResult
@@ -1496,11 +1706,16 @@ final class KeyboardSurfaceView: UIView {
             right: LayoutMetric.buttonHorizontalInset
         )
         container.addSubview(button)
+        let height = button.heightAnchor.constraint(
+            equalToConstant: LayoutMetric.rowHeight - LayoutMetric.buttonVerticalInset * 2
+        )
+        keyButtonHeightConstraints.append(height)
         NSLayoutConstraint.activate([
             button.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: LayoutMetric.buttonHorizontalInset),
             button.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -LayoutMetric.buttonHorizontalInset),
             button.topAnchor.constraint(equalTo: container.topAnchor, constant: LayoutMetric.buttonVerticalInset),
-            button.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -LayoutMetric.buttonVerticalInset)
+            button.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -LayoutMetric.buttonVerticalInset),
+            height
         ])
         return container
     }
@@ -1546,6 +1761,35 @@ final class KeyboardSurfaceView: UIView {
         button.setContentCompressionResistancePriority(.required, for: .horizontal)
         button.setContentHuggingPriority(.defaultLow, for: .horizontal)
         return button
+    }
+
+    private func makeFullAccessPromptButton() -> UIButton {
+        let button = UIButton(type: .system)
+        button.configuration = nil
+        button.setTitleColor(SuggestionStyle.personalizedAccent, for: .normal)
+        button.titleLabel?.font = .systemFont(ofSize: 14, weight: .semibold)
+        button.titleLabel?.numberOfLines = 1
+        button.titleLabel?.lineBreakMode = .byTruncatingTail
+        button.titleLabel?.adjustsFontSizeToFitWidth = true
+        button.titleLabel?.minimumScaleFactor = 0.7
+        button.titleLabel?.allowsDefaultTighteningForTruncation = true
+        button.contentHorizontalAlignment = .center
+        button.setImage(UIImage(systemName: "lock.open"), for: .normal)
+        button.tintColor = SuggestionStyle.personalizedAccent
+        button.imageEdgeInsets = UIEdgeInsets(top: 0, left: -6, bottom: 0, right: 6)
+        button.accessibilityIdentifier = AtlasSuggestionKind.enableFullAccess.rawValue
+        return button
+    }
+
+    @objc private func fullAccessPromptTapped(_ sender: UIButton) {
+        let touchTiming = consumeTouchTiming(for: sender)
+        guard let text = sender.title(for: .normal), !text.isEmpty else { return }
+        delegate?.keyboardSurfaceView(
+            self,
+            didAccept: AtlasSuggestion(text: text, kind: .enableFullAccess, score: 0),
+            touchStartedAt: touchTiming.startedAt,
+            touchEndedAt: touchTiming.endedAt
+        )
     }
 
     private func makeToolbarIconButton(systemName: String, accessibilityLabel: String) -> UIButton {
@@ -1667,6 +1911,16 @@ final class KeyboardSurfaceView: UIView {
     private func setSuggestionTitle(_ title: String, for button: UIButton) {
         guard button.title(for: .normal) != title else { return }
         button.setTitle(title, for: .normal)
+    }
+
+    private func applySuggestionStyle(_ kind: AtlasSuggestionKind?, to button: UIButton) {
+        let isPersonalized = kind == .personal
+        button.setTitleColor(isPersonalized ? SuggestionStyle.personalizedAccent : .label, for: .normal)
+        button.backgroundColor = isPersonalized ? .black : .clear
+        button.layer.cornerRadius = isPersonalized ? 7 : 0
+        button.layer.borderWidth = isPersonalized ? 1 : 0
+        button.layer.borderColor = isPersonalized ? SuggestionStyle.personalizedAccent.cgColor : nil
+        button.clipsToBounds = isPersonalized
     }
 
     private func buildSuggestionSeparators() {
@@ -2264,6 +2518,156 @@ final class KeyboardSurfaceView: UIView {
         )
     }
 
+    @objc private func suggestionLongPressed(_ recognizer: UILongPressGestureRecognizer) {
+        guard recognizer.state == .began,
+              let button = recognizer.view as? UIButton,
+              let text = button.title(for: .normal),
+              !text.isEmpty,
+              button.accessibilityIdentifier == AtlasSuggestionKind.personal.rawValue
+        else { return }
+
+        // The long-press recognizer cancels the button's touch tracking, so lifting the
+        // finger won't also fire touchUpInside and accept the suggestion.
+        _ = consumeTouchTiming(for: button)
+        triggerKeyFeedback()
+        presentForgetPersonalWordDialog(for: text)
+    }
+
+    // MARK: - Forget personal word dialog
+    // A themed, in-keyboard confirmation that matches the keyboard surface instead of a
+    // stock system alert. Presented when a golden personalized suggestion is long-pressed.
+    private func presentForgetPersonalWordDialog(for word: String) {
+        forgetDialogOverlay?.removeFromSuperview()
+
+        let overlay = UIView()
+        overlay.frame = bounds
+        overlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        overlay.backgroundColor = UIColor.black.withAlphaComponent(0.45)
+        overlay.alpha = 0
+        let backdropTap = UITapGestureRecognizer(target: self, action: #selector(forgetDialogBackdropTapped))
+        overlay.addGestureRecognizer(backdropTap)
+        addSubview(overlay)
+        forgetDialogOverlay = overlay
+
+        let card = UIView()
+        card.translatesAutoresizingMaskIntoConstraints = false
+        card.backgroundColor = UIColor { trait in
+            trait.userInterfaceStyle == .dark
+                ? UIColor(red: 0.16, green: 0.17, blue: 0.19, alpha: 1)
+                : UIColor(red: 0.97, green: 0.97, blue: 0.98, alpha: 1)
+        }
+        card.layer.cornerRadius = 20
+        card.layer.borderWidth = 1
+        card.layer.borderColor = SuggestionStyle.personalizedAccent.withAlphaComponent(0.5).cgColor
+        card.clipsToBounds = true
+        // Swallow taps so tapping the card doesn't fall through to the backdrop dismissal.
+        card.isUserInteractionEnabled = true
+        overlay.addSubview(card)
+
+        let title = UILabel()
+        title.translatesAutoresizingMaskIntoConstraints = false
+        title.text = "Stop suggesting “\(word)”?"
+        title.font = .systemFont(ofSize: 17, weight: .semibold)
+        title.textColor = .label
+        title.textAlignment = .center
+        title.numberOfLines = 2
+        title.lineBreakMode = .byTruncatingTail
+
+        let message = UILabel()
+        message.translatesAutoresizingMaskIntoConstraints = false
+        message.text = "Keygram will remove it from your personalized suggestions."
+        message.font = .systemFont(ofSize: 13, weight: .regular)
+        message.textColor = .secondaryLabel
+        message.textAlignment = .center
+        message.numberOfLines = 0
+
+        let cancelButton = makeForgetDialogButton(title: "Cancel", isDestructive: false)
+        cancelButton.addTarget(self, action: #selector(forgetDialogCancelTapped), for: .touchUpInside)
+
+        let removeButton = makeForgetDialogButton(title: "Remove", isDestructive: true)
+        removeButton.accessibilityValue = word
+        removeButton.addTarget(self, action: #selector(forgetDialogRemoveTapped(_:)), for: .touchUpInside)
+
+        let buttonRow = UIStackView(arrangedSubviews: [cancelButton, removeButton])
+        buttonRow.translatesAutoresizingMaskIntoConstraints = false
+        buttonRow.axis = .horizontal
+        buttonRow.spacing = 10
+        buttonRow.distribution = .fillEqually
+
+        card.addSubview(title)
+        card.addSubview(message)
+        card.addSubview(buttonRow)
+
+        NSLayoutConstraint.activate([
+            card.centerXAnchor.constraint(equalTo: overlay.centerXAnchor),
+            card.centerYAnchor.constraint(equalTo: overlay.centerYAnchor),
+            card.leadingAnchor.constraint(greaterThanOrEqualTo: overlay.leadingAnchor, constant: 24),
+            card.trailingAnchor.constraint(lessThanOrEqualTo: overlay.trailingAnchor, constant: -24),
+            card.widthAnchor.constraint(lessThanOrEqualToConstant: 320),
+
+            title.topAnchor.constraint(equalTo: card.topAnchor, constant: 18),
+            title.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 18),
+            title.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -18),
+
+            message.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 8),
+            message.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 18),
+            message.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -18),
+
+            buttonRow.topAnchor.constraint(equalTo: message.bottomAnchor, constant: 18),
+            buttonRow.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            buttonRow.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            buttonRow.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14),
+            buttonRow.heightAnchor.constraint(equalToConstant: 44)
+        ])
+
+        card.transform = CGAffineTransform(scaleX: 0.92, y: 0.92)
+        UIView.animate(withDuration: 0.18, delay: 0, options: .curveEaseOut) {
+            overlay.alpha = 1
+            card.transform = .identity
+        }
+    }
+
+    private func makeForgetDialogButton(title: String, isDestructive: Bool) -> UIButton {
+        let button = UIButton(type: .system)
+        button.setTitle(title, for: .normal)
+        button.titleLabel?.font = .systemFont(ofSize: 16, weight: .semibold)
+        button.layer.cornerRadius = 12
+        button.clipsToBounds = true
+        if isDestructive {
+            button.setTitleColor(.white, for: .normal)
+            button.backgroundColor = UIColor.systemRed
+        } else {
+            button.setTitleColor(.label, for: .normal)
+            button.backgroundColor = UIColor.label.withAlphaComponent(0.1)
+        }
+        return button
+    }
+
+    private func dismissForgetPersonalWordDialog() {
+        guard let overlay = forgetDialogOverlay else { return }
+        forgetDialogOverlay = nil
+        UIView.animate(withDuration: 0.15, animations: {
+            overlay.alpha = 0
+        }, completion: { _ in
+            overlay.removeFromSuperview()
+        })
+    }
+
+    @objc private func forgetDialogBackdropTapped() {
+        dismissForgetPersonalWordDialog()
+    }
+
+    @objc private func forgetDialogCancelTapped() {
+        dismissForgetPersonalWordDialog()
+    }
+
+    @objc private func forgetDialogRemoveTapped(_ sender: UIButton) {
+        let word = sender.accessibilityValue ?? ""
+        dismissForgetPersonalWordDialog()
+        guard !word.isEmpty else { return }
+        delegate?.keyboardSurfaceView(self, didRequestForgetPersonalWord: word)
+    }
+
     @objc private func clipboardTapped(_ sender: UIButton) {
         _ = consumeTouchTiming(for: sender)
         delegate?.keyboardSurfaceViewDidTapClipboard(self)
@@ -2640,9 +3044,55 @@ private final class EmojiCell: UICollectionViewCell {
     }
 }
 
+/// A key row whose hit-testing rescues taps that land in the dead space at a row's
+/// ends. When the default traversal hits a spacer or gap (not a key), the touch is
+/// rerouted to the nearest key whose stretched touch target covers the point — so a
+/// reach-miss just past an edge key like "a" still registers as that key.
+final class KeyboardRowStackView: UIStackView {
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        let result = super.hitTest(point, with: event)
+        if let result, result.enclosingKeyboardButton != nil {
+            return result
+        }
+
+        var best: KeyboardButton?
+        var bestDistance = CGFloat.greatestFiniteMagnitude
+        for button in keyboardButtonDescendants() {
+            let local = convert(point, to: button)
+            guard button.point(inside: local, with: event) else { continue }
+            let distance = abs(local.x - button.bounds.midX)
+            if distance < bestDistance {
+                bestDistance = distance
+                best = button
+            }
+        }
+        return best ?? result
+    }
+
+    private func keyboardButtonDescendants() -> [KeyboardButton] {
+        arrangedSubviews.flatMap { view -> [KeyboardButton] in
+            if let button = view as? KeyboardButton { return [button] }
+            return view.subviews.compactMap { $0 as? KeyboardButton }
+        }
+    }
+}
+
+private extension UIView {
+    var enclosingKeyboardButton: KeyboardButton? {
+        var view: UIView? = self
+        while let current = view {
+            if let button = current as? KeyboardButton { return button }
+            view = current.superview
+        }
+        return nil
+    }
+}
+
 final class KeyboardButton: UIButton {
     let key: KeyboardKey
     var hitTestOutsets: UIEdgeInsets = .zero
+    /// Character inserted when this key is long-pressed (e.g. "1" for the "q" key).
+    var longPressCharacter: String?
     private var latestTouchLocationInButton: CGPoint?
 
     init(key: KeyboardKey) {

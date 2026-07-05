@@ -31,8 +31,13 @@ struct ContentView: View {
         AtlasConfiguration.learnNewWordsEnabledKey,
         store: UserDefaults(suiteName: AtlasConfiguration.appGroupIdentifier)
     ) private var learnNewWordsEnabled = true
+    @AppStorage(
+        AtlasConfiguration.neuralOnlyEvaluationEnabledKey,
+        store: UserDefaults(suiteName: AtlasConfiguration.appGroupIdentifier)
+    ) private var neuralOnlyEvaluationEnabled = false
     @State private var darkKeyboardEnabled = false
     @State private var autocorrectFeedback = AutocorrectFeedbackStore.shared.summaries(limit: 5_000)
+    @State private var nextWordEvaluation = NextWordFeedbackStore.shared.evaluationSnapshot()
     @State private var learnedTypingTaps = Self.loadLearnedTypingTaps()
     @State private var typingModelHealth = Self.loadTypingModelHealth()
     @State private var showingSignOutPlaceholder = false
@@ -66,6 +71,9 @@ struct ContentView: View {
             guard newValue == .active else { return }
             setupStatus = KeyboardSetupStatus.current()
         }
+        .onChange(of: neuralOnlyEvaluationEnabled) {
+            resetNextWordEvaluation()
+        }
     }
 
     private var homeContent: some View {
@@ -81,7 +89,12 @@ struct ContentView: View {
                         aiRewriteEnabled: $aiRewriteEnabled,
                         personalizedAutocorrectEnabled: $personalizedAutocorrectEnabled,
                         learnNewWordsEnabled: $learnNewWordsEnabled,
-                        darkKeyboardEnabled: $darkKeyboardEnabled
+                        darkKeyboardEnabled: $darkKeyboardEnabled,
+                        neuralOnlyEvaluationEnabled: $neuralOnlyEvaluationEnabled,
+                        nextWordEvaluation: nextWordEvaluation,
+                        refreshEvaluation: refreshNextWordEvaluation,
+                        resetEvaluation: resetNextWordEvaluation,
+                        resetPredictionFeedback: resetPredictionFeedback
                     )
                 },
                 typingPersonalization: {
@@ -133,6 +146,7 @@ struct ContentView: View {
     private func refreshLocalState() {
         sessions = AtlasSessionStore.shared.loadSessions()
         autocorrectFeedback = AutocorrectFeedbackStore.shared.summaries(limit: 5_000)
+        refreshNextWordEvaluation()
         refreshTypingPersonalization()
     }
 
@@ -158,6 +172,19 @@ struct ContentView: View {
     private func resetCorrections() {
         AutocorrectFeedbackStore.shared.reset()
         autocorrectFeedback = []
+    }
+
+    private func refreshNextWordEvaluation() {
+        nextWordEvaluation = NextWordFeedbackStore.shared.evaluationSnapshot()
+    }
+
+    private func resetNextWordEvaluation() {
+        NextWordFeedbackStore.shared.resetEvaluation()
+        refreshNextWordEvaluation()
+    }
+
+    private func resetPredictionFeedback() {
+        NextWordFeedbackStore.shared.resetFeedback()
     }
 
     private func refreshTypingPersonalization() {
@@ -290,14 +317,14 @@ private struct HomeView<KeyboardSettings: View, TypingPersonalization: View, Per
                         }
                     }
 
-//                    HomeSection {
-//                        HomeButtonRow(
-//                            "Sign out",
-//                            role: .destructive,
-//                            rowHeight: metrics.rowHeight,
-//                            action: signOutAction
-//                        )
-//                    }
+                   HomeSection {
+                       HomeButtonRow(
+                           "Sign out",
+                           role: .destructive,
+                           rowHeight: metrics.rowHeight,
+                           action: signOutAction
+                       )
+                   }
                 }
             }
             .padding(.top, metrics.topPadding)
@@ -520,6 +547,11 @@ private struct KeyboardSettingsView: View {
     @Binding var personalizedAutocorrectEnabled: Bool
     @Binding var learnNewWordsEnabled: Bool
     @Binding var darkKeyboardEnabled: Bool
+    @Binding var neuralOnlyEvaluationEnabled: Bool
+    var nextWordEvaluation: NextWordEvaluationSnapshot
+    var refreshEvaluation: () -> Void
+    var resetEvaluation: () -> Void
+    var resetPredictionFeedback: () -> Void
     private let enabledTint = Color(
         red: 246.0 / 255.0,
         green: 207.0 / 255.0,
@@ -542,6 +574,34 @@ private struct KeyboardSettingsView: View {
                 Text("Personalized autocorrect learns from corrections you keep and corrections you undo. Everything stays on this device.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
+            }
+
+            Section("Prediction Quality") {
+                Toggle("Neural-only evaluation", isOn: $neuralOnlyEvaluationEnabled)
+                Text("Diagnostic mode. Suggestions and accuracy use neural scores only; changing this setting resets the quality metrics.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                LabeledContent("Evaluated words", value: "\(nextWordEvaluation.predictionCount)")
+                LabeledContent(
+                    "Top suggestion",
+                    value: nextWordEvaluation.top1Accuracy.formatted(.percent.precision(.fractionLength(1)))
+                )
+                LabeledContent(
+                    "Top 3",
+                    value: nextWordEvaluation.top3Accuracy.formatted(.percent.precision(.fractionLength(1)))
+                )
+                LabeledContent(
+                    "Suggestion selected",
+                    value: nextWordEvaluation.suggestionSelectionRate.formatted(.percent.precision(.fractionLength(1)))
+                )
+                LabeledContent(
+                    "Average inference",
+                    value: "\(nextWordEvaluation.averageInferenceMilliseconds.formatted(.number.precision(.fractionLength(1)))) ms"
+                )
+                LabeledContent("P95 inference", value: "<= \(nextWordEvaluation.p95InferenceMilliseconds) ms")
+                Button("Refresh metrics", action: refreshEvaluation)
+                Button("Reset metrics", role: .destructive, action: resetEvaluation)
+                Button("Reset prediction feedback", role: .destructive, action: resetPredictionFeedback)
             }
 
 //            Section("AI Rewrite Privacy") {

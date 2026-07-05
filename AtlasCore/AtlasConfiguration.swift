@@ -7,6 +7,7 @@ enum AtlasConfiguration {
     static let aiRewriteEnabledKey = "atlas.aiRewriteEnabled"
     static let aiRewriteDisclosureAcceptedKey = "atlas.aiRewriteDisclosureAccepted"
     static let inferenceSuggestionsEnabledKey = "atlas.inferenceSuggestionsEnabled"
+    static let neuralOnlyEvaluationEnabledKey = "atlas.neuralOnlyEvaluationEnabled"
     static let personalizedAutocorrectEnabledKey = "atlas.personalizedAutocorrectEnabled"
     static let personalizedTypingEnabledKey = "atlas.personalizedTypingEnabled"
     static let personalizedTypingActivationThreshold = 1_000
@@ -18,7 +19,7 @@ enum AtlasConfiguration {
     static let keyboardLastActiveAtKey = "atlas.keyboardLastActiveAt"
     static let onboardingCompletedKey = "atlas.onboardingCompleted"
     static let engramLearningMigrationVersionKey = "atlas.engramLearningMigrationVersion"
-    static let currentEngramLearningMigrationVersion = 5
+    static let currentEngramLearningMigrationVersion = 6
     static let vocabularySize = 32_000
     static let attentionLayerCount = 4
     static let glaLayerCount = 4
@@ -27,8 +28,24 @@ enum AtlasConfiguration {
     nonisolated static let suggestionVocabularyLimit = 15_000
     nonisolated static let nextWordContextWordLimit = 20
     nonisolated static let personalNGramCandidateLimit = 100
+    nonisolated static let neuralNextWordCandidateLimit = 64
+    nonisolated static let neuralWordBeamWidth = 6
+    nonisolated static let neuralWordBeamDepth = 5
+    nonisolated static let neuralWordBeamStepBudget = 12
+    nonisolated static let neuralLengthNormalizationExponent = 0.72
+    nonisolated static let exactNeuralRescoreCandidateLimit = 24
+    nonisolated static let exactNeuralRescoreTokenLimit = 8
+    nonisolated static let exactNeuralRescoreStepBudget = 168
+    nonisolated static let marginalPersonalizationPriorStrength = 24.0
+    nonisolated static let marginalPersonalizationMinimumCount = 2
+    nonisolated static let marginalPersonalizationStrength = 0.28
+    nonisolated static let marginalPersonalizationMaximumBoost = 0.85
     nonisolated static let personalEngramMaxEntries = 1_500
     nonisolated static let personalNGramMaxTypesPerOrder = 2_000
     nonisolated static let personalNGramMaxContinuationContexts = 3_000
     nonisolated static let personalNGramMaxContinuationsPerContext = 12
+    nonisolated static let personalPhraseMaxContexts = 2_000
+    nonisolated static let personalPhraseMinimumContextWords = 2
+    nonisolated static let personalPhraseMinimumCount = 3
+    nonisolated static let personalPhraseMaxContinuationsPerContext = 8
 }

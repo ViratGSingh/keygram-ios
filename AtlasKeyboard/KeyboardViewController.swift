@@ -151,6 +151,7 @@ final class KeyboardViewController: UIInputViewController {
     private var pendingInputLatencyEvents: [InputLatencyEvent] = []
     private var lastSuggestionRequest: SuggestionRequest?
     private var displayedSuggestions: [AtlasSuggestion] = []
+    private var pendingNextWordPrediction: PendingNextWordPrediction?
     private var autocorrectEngine: AtlasAutocorrectEngine?
     private var isAutocorrectLoading = false
     private let liveWordDecoder = LiveWordDecoder()
@@ -183,7 +184,7 @@ final class KeyboardViewController: UIInputViewController {
         var context: String
         var selectedWord: String?
         var rightContext: String
-        var sessionUpdatedAt: Date
+        var neuralOnly: Bool
     }
 
     private struct InputLatencyEvent {
@@ -191,6 +192,11 @@ final class KeyboardViewController: UIInputViewController {
         var touchStartedAt: CFTimeInterval
         var touchEndedAt: CFTimeInterval
         var submittedAt: CFTimeInterval
+    }
+
+    private struct PendingNextWordPrediction {
+        var suggestions: [String]
+        var context: String
     }
 
     private struct AutocorrectUndo {
@@ -623,6 +629,11 @@ final class KeyboardViewController: UIInputViewController {
             if currentVersion < 3 {
                 session.engram.resetNGramLanguageModel()
             }
+            let removedNGramWords = currentVersion < 6
+                ? session.engram.removeLikelyMistypedNGramWords {
+                    autocorrectEngine.learningAssessment(for: $0)
+                }
+                : []
             let learningChanges = currentVersion < 5
                 ? session.engram.reevaluateLearningStates {
                     autocorrectEngine.learningAssessment(for: $0)
@@ -646,6 +657,12 @@ final class KeyboardViewController: UIInputViewController {
                 }
                 if currentVersion < 3 {
                     self.logAutocorrect("reset personal n-gram model for schema v3")
+                }
+                if !removedNGramWords.isEmpty {
+                    self.logAutocorrect(
+                        "removed likely mistyped n-gram words for schema v6: "
+                            + removedNGramWords.joined(separator: ", ")
+                    )
                 }
                 if learningChanges.promoted > 0 || learningChanges.demoted > 0 {
                     self.logAutocorrect(
@@ -1093,7 +1110,20 @@ final class KeyboardViewController: UIInputViewController {
         guard shouldUseModel else {
             suggestionGeneration += 1
             needsSuggestionRefreshAfterInference = false
+            lastSuggestionRequest = nil
             applySuggestions(lightweightSuggestions(context: context, selectedWord: selectedWord))
+            return
+        }
+
+        // The next-word model needs Full Access. When it isn't granted, surface a tap-to-enable
+        // prompt in place of predictions instead of loading the engine or showing stale results.
+        if selectedWord == nil,
+           !hasFullAccess,
+           shouldGenerateSuggestions(context: context, selectedWord: nil) {
+            suggestionGeneration += 1
+            needsSuggestionRefreshAfterInference = false
+            lastSuggestionRequest = nil
+            presentFullAccessPrompt()
             return
         }
 
@@ -1109,14 +1139,20 @@ final class KeyboardViewController: UIInputViewController {
         let rightContext = textDocumentProxy.documentContextAfterInput ?? ""
         let session = activeSession
         let modelContext = selectedWord == nil ? nextWordPredictionContext(from: context) : context
+        let neuralOnly = shouldUseNeuralOnlyEvaluation()
         let request = SuggestionRequest(
             context: modelContext,
             selectedWord: selectedWord,
             rightContext: rightContext,
-            sessionUpdatedAt: session.updatedAt
+            neuralOnly: neuralOnly
         )
 
-        guard request != lastSuggestionRequest else { return }
+        guard request != lastSuggestionRequest else {
+            #if DEBUG
+            NSLog("[Keygram Inference] skipped duplicate request context=%@", logSnippet(modelContext))
+            #endif
+            return
+        }
 
         guard shouldGenerateSuggestions(context: context, selectedWord: selectedWord) else {
             suggestionGeneration += 1
@@ -1139,10 +1175,12 @@ final class KeyboardViewController: UIInputViewController {
         let global = Engram()
         let loadedAutocorrectEngine = autocorrectEngine
         let usePersonalizedAutocorrect = shouldUsePersonalizedAutocorrect()
+        let nextWordFeedback = NextWordFeedbackStore.shared.feedbackSnapshot()
         suggestionGeneration += 1
         let generation = suggestionGeneration
         lastSuggestionRequest = request
         isSuggestionInferenceRunning = true
+        let inferenceStartedAt = CACurrentMediaTime()
 
         inferenceQueue.async { [weak self] in
             guard let self else { return }
@@ -1191,13 +1229,24 @@ final class KeyboardViewController: UIInputViewController {
                 if let selectedWord {
                     self.logAutocorrect("no correction candidates for '\(selectedWord)'; falling back to normal suggestions")
                 }
-                suggestions = engine.suggestions(for: modelContext, session: session, globalEngram: global)
+                suggestions = engine.suggestions(
+                    for: modelContext,
+                    session: session,
+                    globalEngram: global,
+                    feedback: nextWordFeedback,
+                    neuralOnly: neuralOnly
+                )
             }
 
             DispatchQueue.main.async {
                 self.isSuggestionInferenceRunning = false
                 if generation == self.suggestionGeneration {
-                    self.applySuggestions(suggestions)
+                    let inferenceMilliseconds = (CACurrentMediaTime() - inferenceStartedAt) * 1_000
+                    self.applySuggestions(
+                        suggestions,
+                        evaluationContext: selectedWord == nil ? modelContext : nil,
+                        inferenceMilliseconds: selectedWord == nil ? inferenceMilliseconds : nil
+                    )
                 }
                 if self.needsSuggestionRefreshAfterInference {
                     self.needsSuggestionRefreshAfterInference = false
@@ -1226,6 +1275,11 @@ final class KeyboardViewController: UIInputViewController {
         guard shouldUseInferenceSuggestions() else { return false }
         if selectedWord != nil { return true }
         return endsInWhitespace(context)
+    }
+
+    private func shouldUseNeuralOnlyEvaluation() -> Bool {
+        let defaults = UserDefaults(suiteName: AtlasConfiguration.appGroupIdentifier) ?? .standard
+        return defaults.bool(forKey: AtlasConfiguration.neuralOnlyEvaluationEnabledKey)
     }
 
     private func endsInWhitespace(_ text: String) -> Bool {
@@ -1260,15 +1314,98 @@ final class KeyboardViewController: UIInputViewController {
         else {
             return []
         }
-        return autocorrectEngine.completions(
+
+        let leftContext = leftContextBeforeLastWord(context: context, word: partial)
+        var suggestions: [AtlasSuggestion] = []
+        if let decision = autocorrectEngine.correction(
             for: partial,
-            leftContext: leftContextBeforeLastWord(context: context, word: partial),
+            leftContext: leftContext,
+            sessionEngram: activeSession.engram,
+            globalEngram: Engram(),
+            feedback: AutocorrectFeedbackSnapshot()
+        ), decision.replacement.localizedCaseInsensitiveCompare(partial) != .orderedSame {
+            suggestions.append(
+                AtlasSuggestion(
+                    text: decision.replacement,
+                    kind: .correction,
+                    score: 0.8 + min(0.19, decision.confidence * 0.19)
+                )
+            )
+        }
+
+        suggestions.append(contentsOf: autocorrectEngine.completions(
+            for: partial,
+            leftContext: leftContext,
             sessionEngram: activeSession.engram,
             globalEngram: Engram()
-        )
+        ))
+
+        let deduped = Dictionary(grouping: suggestions, by: { $0.text.lowercased() })
+            .compactMap { $0.value.max { $0.score < $1.score } }
+        return Array(deduped.sorted { $0.score > $1.score }.prefix(AtlasConfiguration.maxSuggestions))
     }
 
-    private func applySuggestions(_ suggestions: [AtlasSuggestion]) {
+    private static let fullAccessPromptMessage = "Enable Full Access to turn on next-word prediction"
+
+    /// Shows the Full Access call-to-action in the suggestion bar, replacing any predictions.
+    /// Clears cached prediction state so real suggestions render again once access is granted.
+    private func presentFullAccessPrompt() {
+        displayedSuggestions = []
+        pendingNextWordPrediction = nil
+        if let undoPillExpiresAt, undoPillExpiresAt > Date() { return }
+        keyboardView?.showFullAccessPrompt(Self.fullAccessPromptMessage)
+    }
+
+    /// Opens the containing app's Settings page (where Full Access is toggled) by walking the
+    /// responder chain to reach `UIApplication`, since extensions can't use `UIApplication.shared`.
+    private func openContainingAppSettings() {
+        guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+        // Invoke UIApplication.open(_:options:completionHandler:) by its implementation pointer.
+        // The method is compile-time unavailable in extensions, and a typed `as?` cast to a bridging
+        // protocol fails (UIApplication doesn't formally adopt it), so reach it by selector instead.
+        let selector = NSSelectorFromString("openURL:options:completionHandler:")
+        var responder: UIResponder? = self
+        while let current = responder {
+            if let application = current as? UIApplication, application.responds(to: selector) {
+                typealias OpenURLFunction = @convention(c) (
+                    NSObject, Selector, NSURL, NSDictionary, AnyObject?
+                ) -> Void
+                let implementation = application.method(for: selector)
+                let openURL = unsafeBitCast(implementation, to: OpenURLFunction.self)
+                openURL(application, selector, url as NSURL, NSDictionary(), nil)
+                return
+            }
+            responder = current.next
+        }
+        NSLog("Keygram: could not reach UIApplication from keyboard extension to open Settings")
+    }
+
+    private func applySuggestions(
+        _ suggestions: [AtlasSuggestion],
+        evaluationContext: String? = nil,
+        inferenceMilliseconds: Double? = nil
+    ) {
+        if let inferenceMilliseconds {
+            NextWordFeedbackStore.shared.recordInference(milliseconds: inferenceMilliseconds)
+        }
+        if let evaluationContext,
+           endsInWhitespace(evaluationContext) {
+            let predictionTexts = suggestions
+                .filter { $0.kind == .nextWord || $0.kind == .personal }
+                .map(\.text)
+            let isNewPrediction = pendingNextWordPrediction?.suggestions != predictionTexts
+                || pendingNextWordPrediction?.context != evaluationContext
+            if !predictionTexts.isEmpty, isNewPrediction {
+                pendingNextWordPrediction = PendingNextWordPrediction(
+                    suggestions: predictionTexts,
+                    context: evaluationContext
+                )
+                NextWordFeedbackStore.shared.recordExposure(
+                    predictions: predictionTexts,
+                    context: evaluationContext
+                )
+            }
+        }
         guard suggestions != displayedSuggestions else { return }
         displayedSuggestions = suggestions
         if let undoPillExpiresAt, undoPillExpiresAt > Date() {
@@ -1279,6 +1416,10 @@ final class KeyboardViewController: UIInputViewController {
 
     private func acceptSuggestion(_ suggestion: AtlasSuggestion, touchStartedAt: CFTimeInterval, touchEndedAt: CFTimeInterval) {
         pendingRewriteUndo = nil
+        if suggestion.kind == .enableFullAccess {
+            openContainingAppSettings()
+            return
+        }
         if suggestion.kind == .undoAutocorrection {
             _ = undoLastAutocorrection(touchStartedAt: touchStartedAt, touchEndedAt: touchEndedAt)
             liveWordDecoder.reset()
@@ -1289,6 +1430,9 @@ final class KeyboardViewController: UIInputViewController {
         liveWordDecoder.reset()
         let pathStartedAt = CACurrentMediaTime()
         let context = contextBeforeInput()
+        if suggestion.kind != .correction {
+            recordPendingNextWordOutcome(actualText: suggestion.text, selectedSuggestion: true)
+        }
         commitTouchWord(actualWord: suggestion.text)
         var insertedWordBoundary = false
         if suggestion.kind == .correction, let selectedWord = selectedCorrectionWord() {
@@ -1526,13 +1670,15 @@ final class KeyboardViewController: UIInputViewController {
         guard shouldLearnNewWords() else { return }
         let sessionName = activeSession.name
         let glaState = engine?.currentGLAState() ?? activeSession.glaState
+        let assessment = autocorrectEngine?.learningAssessment(for: word) ?? Engram.LearningAssessment()
         enqueueEngramUpdate { session in
-            session.engram.confirmAfterAutocorrectionUndo(word, sessionName: sessionName)
+            session.engram.confirmAfterAutocorrectionUndo(word, sessionName: sessionName, assessment: assessment)
             session.glaState = glaState
         }
     }
 
     private func observeTypedWord(_ word: String, assessment: Engram.LearningAssessment = Engram.LearningAssessment()) {
+        recordPendingNextWordOutcome(actualText: word, selectedSuggestion: false)
         guard shouldLearnNewWords() else { return }
         let sessionName = activeSession.name
         let glaState = engine?.currentGLAState() ?? activeSession.glaState
@@ -1547,10 +1693,13 @@ final class KeyboardViewController: UIInputViewController {
         observeTypedWord(word, assessment: assessment)
     }
 
-    private func learnLatestContext(_ context: String) {
+    private func learnLatestContext(
+        _ context: String,
+        finalWordAssessment: Engram.LearningAssessment? = nil
+    ) {
         guard shouldLearnNewWords() else { return }
         enqueueEngramUpdate { session in
-            session.engram.learnLatestContext(context)
+            session.engram.learnLatestContext(context, finalWordAssessment: finalWordAssessment)
         }
     }
 
@@ -1560,6 +1709,29 @@ final class KeyboardViewController: UIInputViewController {
         enqueueEngramUpdate { session in
             session.engram.learnMessage(text, sessionName: sessionName)
         }
+    }
+
+    private func recordPendingNextWordOutcome(actualText: String, selectedSuggestion: Bool) {
+        guard let pendingNextWordPrediction else { return }
+        self.pendingNextWordPrediction = nil
+        NextWordFeedbackStore.shared.recordOutcome(
+            predictions: pendingNextWordPrediction.suggestions,
+            actualText: actualText,
+            selectedSuggestion: selectedSuggestion,
+            context: pendingNextWordPrediction.context
+        )
+        #if DEBUG
+        let snapshot = NextWordFeedbackStore.shared.evaluationSnapshot()
+        NSLog(
+            "[Keygram NextWord Eval] samples=%d top1=%.1f%% top3=%.1f%% selected=%.1f%% avg=%.1fms p95<=%dms",
+            snapshot.predictionCount,
+            snapshot.top1Accuracy * 100,
+            snapshot.top3Accuracy * 100,
+            snapshot.suggestionSelectionRate * 100,
+            snapshot.averageInferenceMilliseconds,
+            snapshot.p95InferenceMilliseconds
+        )
+        #endif
     }
 
     private func refreshLiveAutocorrect() {
@@ -1650,7 +1822,9 @@ final class KeyboardViewController: UIInputViewController {
     private func rejectPendingAutocorrection(_ undo: AutocorrectUndo) {
         pendingAutocorrection = nil
         guard shouldUsePersonalizedAutocorrect() else { return }
-        AutocorrectFeedbackStore.shared.recordRejected(
+        // A deliberate undo is a strong signal: suppress this correction right away
+        // instead of waiting for it to be rejected several times.
+        AutocorrectFeedbackStore.shared.recordExplicitRejection(
             typed: undo.original.lowercased(),
             correction: undo.correction.lowercased(),
             contextKey: undo.contextKey
@@ -1731,9 +1905,24 @@ final class KeyboardViewController: UIInputViewController {
                     )
                 }
                 guard let decision else {
+                    if self.scheduleInferenceAutocorrectAfterSpaceFallback(
+                        typedWord: typedWord,
+                        leftContext: leftContext,
+                        contextBeforeSpace: contextBeforeSpace,
+                        contextKey: contextKey,
+                        generation: generation,
+                        touchEndedAt: touchEndedAt,
+                        decisionStartedAt: decisionStartedAt,
+                        trailingDelimiter: trailingDelimiter,
+                        ignoredRejectedCorrection: ignoredRejectedCorrection
+                    ) {
+                        return
+                    }
                     self.logAutocorrect("no space correction for '\(typedWord)'")
-                    self.observeTypedWord(typedWord, assessment: autocorrectEngine.learningAssessment(for: typedWord))
-                    self.learnLatestContext(contextBeforeSpace)
+                    self.recordUncorrectedCompletedWord(
+                        typedWord,
+                        contextBeforeSpace: contextBeforeSpace
+                    )
                     return
                 }
                 guard elapsed <= AutocorrectTiming.maximumApplyDelay else {
@@ -1745,8 +1934,10 @@ final class KeyboardViewController: UIInputViewController {
                             elapsed * 1_000
                         )
                     )
-                    self.observeTypedWord(typedWord, assessment: autocorrectEngine.learningAssessment(for: typedWord))
-                    self.learnLatestContext(contextBeforeSpace)
+                    self.recordUncorrectedCompletedWord(
+                        typedWord,
+                        contextBeforeSpace: contextBeforeSpace
+                    )
                     return
                 }
 
@@ -1761,6 +1952,145 @@ final class KeyboardViewController: UIInputViewController {
         }
 
         return true
+    }
+
+    @discardableResult
+    private func scheduleInferenceAutocorrectAfterSpaceFallback(
+        typedWord: String,
+        leftContext: String,
+        contextBeforeSpace: String,
+        contextKey: String,
+        generation: Int,
+        touchEndedAt: CFTimeInterval,
+        decisionStartedAt: CFTimeInterval,
+        trailingDelimiter: String,
+        ignoredRejectedCorrection: String?
+    ) -> Bool {
+        guard shouldUseInferenceSuggestions(),
+              let engine,
+              !shouldSkipAutocorrectForCurrentField()
+        else {
+            return false
+        }
+
+        let session = activeSession
+        let rightContext = textDocumentProxy.documentContextAfterInput ?? ""
+        let feedback = shouldUsePersonalizedAutocorrect()
+            ? AutocorrectFeedbackStore.shared.snapshot()
+            : AutocorrectFeedbackSnapshot()
+        let adjustedFeedback: AutocorrectFeedbackSnapshot
+        if let ignoredRejectedCorrection {
+            adjustedFeedback = feedback.ignoringOneRejection(
+                typed: typedWord.lowercased(),
+                candidate: ignoredRejectedCorrection.lowercased()
+            )
+        } else {
+            adjustedFeedback = feedback
+        }
+
+        inferenceQueue.async { [weak self] in
+            guard let self else { return }
+            let suggestions = engine.corrections(
+                for: typedWord,
+                leftContext: leftContext,
+                rightContext: rightContext,
+                session: session,
+                globalEngram: Engram()
+            )
+            let decision = self.automaticInferenceAutocorrectDecision(
+                from: suggestions,
+                typedWord: typedWord,
+                feedback: adjustedFeedback
+            )
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self, generation == self.autocorrectGeneration else { return }
+                let elapsed = CACurrentMediaTime() - decisionStartedAt
+                guard elapsed <= AutocorrectTiming.maximumApplyDelay else {
+                    self.logAutocorrect(
+                        String(
+                            format: "skipped late inference space correction '%@' elapsed=%.3fms",
+                            typedWord,
+                            elapsed * 1_000
+                        )
+                    )
+                    self.recordUncorrectedCompletedWord(
+                        typedWord,
+                        contextBeforeSpace: contextBeforeSpace
+                    )
+                    return
+                }
+
+                guard let decision else {
+                    self.logAutocorrect("no inference space correction for '\(typedWord)'")
+                    self.recordUncorrectedCompletedWord(
+                        typedWord,
+                        contextBeforeSpace: contextBeforeSpace
+                    )
+                    return
+                }
+
+                self.logAutocorrect(
+                    String(
+                        format: "inference space correction '%@' -> '%@' confidence=%.3f margin=%.3f elapsed=%.3fms",
+                        decision.original,
+                        decision.replacement,
+                        decision.confidence,
+                        decision.margin,
+                        elapsed * 1_000
+                    )
+                )
+                self.applyAutocorrectDecisionAfterSpace(
+                    decision,
+                    contextKey: contextKey,
+                    touchEndedAt: touchEndedAt,
+                    decisionElapsed: elapsed,
+                    trailingDelimiter: trailingDelimiter
+                )
+            }
+        }
+
+        return true
+    }
+
+    private nonisolated func automaticInferenceAutocorrectDecision(
+        from suggestions: [AtlasSuggestion],
+        typedWord: String,
+        feedback: AutocorrectFeedbackSnapshot
+    ) -> AtlasAutocorrectDecision? {
+        let normalizedTyped = EngramNormalizer.normalize(typedWord)
+        let ranked = suggestions
+            .filter { $0.kind == .correction }
+            .filter { EngramNormalizer.normalize($0.text) != normalizedTyped }
+            .filter {
+                !feedback.shouldSuppressCorrection(
+                    typed: normalizedTyped,
+                    candidate: EngramNormalizer.normalize($0.text)
+                )
+            }
+            .sorted { $0.score > $1.score }
+
+        guard let best = ranked.first else { return nil }
+        let secondScore = ranked.dropFirst().first?.score ?? 0
+        let margin = best.score - secondScore
+        guard best.score >= 0.62, margin >= 0.10 else { return nil }
+
+        return AtlasAutocorrectDecision(
+            original: typedWord,
+            replacement: best.text,
+            confidence: min(0.95, max(0.56, best.score)),
+            margin: margin
+        )
+    }
+
+    private func recordUncorrectedCompletedWord(
+        _ typedWord: String,
+        contextBeforeSpace: String
+    ) {
+        let assessment = autocorrectEngine?.learningAssessment(for: typedWord)
+            ?? Engram.LearningAssessment()
+        observeTypedWord(typedWord, assessment: assessment)
+        learnLatestContext(contextBeforeSpace, finalWordAssessment: assessment)
     }
 
     private func applyAutocorrectDecisionAfterSpace(
@@ -1806,6 +2136,7 @@ final class KeyboardViewController: UIInputViewController {
             correction: decision.replacement.lowercased(),
             contextKey: contextKey
         )
+        recordPendingNextWordOutcome(actualText: decision.replacement, selectedSuggestion: false)
         learnLatestContext(contextBeforeInput())
         scheduleSuggestionRefresh(after: 0)
     }
@@ -2081,8 +2412,10 @@ extension KeyboardViewController: KeyboardSurfaceViewDelegate {
                     ignoredRejectedCorrection: ignoredRejectedCorrection
                 )
                 if !didScheduleAutocorrect, let typedWord {
-                    observeTypedWordUsingAutocorrectLexicon(typedWord)
-                    learnLatestContext(contextBeforeSpace)
+                    let assessment = autocorrectEngine?.learningAssessment(for: typedWord)
+                        ?? Engram.LearningAssessment()
+                    observeTypedWord(typedWord, assessment: assessment)
+                    learnLatestContext(contextBeforeSpace, finalWordAssessment: assessment)
                 }
             }
             scheduleSuggestionRefresh()
@@ -2159,6 +2492,12 @@ extension KeyboardViewController: KeyboardSurfaceViewDelegate {
     func keyboardSurfaceViewDidLongPressSession(_ view: KeyboardSurfaceView) {
         liveWordDecoder.reset()
         endCurrentDraft()
+    }
+
+    func keyboardSurfaceView(_ view: KeyboardSurfaceView, didRequestForgetPersonalWord word: String) {
+        enqueueEngramUpdate { session in
+            session.engram.forget(word)
+        }
     }
 
     func keyboardSurfaceViewDidRequestDismissKeyboard(_ view: KeyboardSurfaceView) {

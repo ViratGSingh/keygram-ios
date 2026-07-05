@@ -65,8 +65,11 @@ struct Engram: Codable, Equatable {
     ) {
         let normalized = EngramNormalizer.normalize(word)
         let tokens = EngramNormalizer.ngramSurfaceTokens(in: word)
-        for token in tokens {
-            ngramLanguageModel.learn(tokens: [token])
+        let shouldLearnNGramImmediately = Self.shouldLearnNGramToken(normalized, assessment: assessment)
+        if shouldLearnNGramImmediately {
+            for token in tokens {
+                ngramLanguageModel.learn(tokens: [token])
+            }
         }
         guard EngramNormalizer.shouldObserve(normalized) else { return }
         guard !assessment.isDictionaryWord else { return }
@@ -78,14 +81,23 @@ struct Engram: Codable, Equatable {
             source: .suggestion,
             assessment: assessment
         )
+        if !shouldLearnNGramImmediately, entries[normalized]?.isConfirmed == true {
+            for token in tokens {
+                ngramLanguageModel.learn(tokens: [token])
+            }
+        }
     }
 
-    mutating func confirmAfterAutocorrectionUndo(_ word: String, sessionName: String) {
-        confirm(word, sessionName: sessionName, source: .autocorrectionUndo)
+    mutating func confirmAfterAutocorrectionUndo(
+        _ word: String,
+        sessionName: String,
+        assessment: LearningAssessment = LearningAssessment()
+    ) {
+        confirm(word, sessionName: sessionName, source: .autocorrectionUndo, assessment: assessment)
     }
 
     mutating func confirmManually(_ word: String, sessionName: String) {
-        confirm(word, sessionName: sessionName, source: .manual)
+        confirm(word, sessionName: sessionName, source: .manual, assessment: LearningAssessment())
     }
 
     mutating func learnMessage(_ text: String, sessionName: String, includeNGrams: Bool = true) {
@@ -103,7 +115,8 @@ struct Engram: Codable, Equatable {
     ) {
         let normalized = EngramNormalizer.normalize(word)
         let tokens = EngramNormalizer.ngramSurfaceTokens(in: word)
-        if tokens.count == 1 {
+        let shouldLearnNGramImmediately = Self.shouldLearnNGramToken(normalized, assessment: assessment)
+        if tokens.count == 1, shouldLearnNGramImmediately {
             ngramLanguageModel.learn(tokens: tokens)
         }
         guard EngramNormalizer.shouldObserve(normalized) else { return }
@@ -115,6 +128,11 @@ struct Engram: Codable, Equatable {
             assessment: assessment,
             vector: PersonalEngramEmbedder.shared.vector(for: normalized)
         )
+        if tokens.count == 1,
+           !shouldLearnNGramImmediately,
+           entries[normalized]?.isConfirmed == true {
+            ngramLanguageModel.learn(tokens: tokens)
+        }
     }
 
     mutating func demoteAfterAcceptedCorrection(_ word: String) {
@@ -169,8 +187,36 @@ struct Engram: Codable, Equatable {
         entries[normalized] = nil
     }
 
+    /// Fully forgets a personalized word so it stops surfacing as a suggestion: drops the
+    /// learned entry and purges every n-gram that references it from the language model.
+    mutating func forget(_ word: String) {
+        let normalized = EngramNormalizer.normalize(word)
+        guard !normalized.isEmpty else { return }
+        entries[normalized] = nil
+        ngramLanguageModel.removeWords([normalized])
+    }
+
     mutating func resetNGramLanguageModel() {
         ngramLanguageModel = PersonalNGramLanguageModel()
+    }
+
+    @discardableResult
+    mutating func removeLikelyMistypedNGramWords(
+        assessmentFor: (String) -> LearningAssessment
+    ) -> [String] {
+        let wordsToRemove = ngramLanguageModel.learnedWords().filter { word in
+            let normalized = EngramNormalizer.normalize(word)
+            guard !normalized.isEmpty else { return false }
+            guard !EngramNormalizer.isProtectedPersonalToken(normalized) else { return false }
+            let entry = entries[normalized]
+            guard entry?.confirmationSource?.isExplicit != true else { return false }
+            guard entry?.isConfirmed != true else { return false }
+            let assessment = assessmentFor(normalized)
+            return !assessment.isDictionaryWord && Self.isDictionaryNearMiss(assessment)
+        }
+        let uniqueWords = Set(wordsToRemove)
+        ngramLanguageModel.removeWords(uniqueWords)
+        return Array(uniqueWords).sorted()
     }
 
     @discardableResult
@@ -309,13 +355,27 @@ struct Engram: Codable, Equatable {
         ngramLanguageModel.phrasePredictions(for: context, limit: limit)
     }
 
-    mutating func learnLatestContext(_ text: String) {
+    mutating func learnLatestContext(
+        _ text: String,
+        finalWordAssessment: LearningAssessment? = nil
+    ) {
         guard let latestSequence = EngramNormalizer.ngramSurfaceTokenSequences(in: text).last else { return }
+        if let finalWordAssessment,
+           let finalWord = latestSequence.last {
+            let normalized = EngramNormalizer.normalize(finalWord)
+            guard Self.shouldLearnNGramToken(normalized, assessment: finalWordAssessment) else {
+                return
+            }
+        }
         ngramLanguageModel.learnLatest(tokens: latestSequence)
     }
 
     func nextWordConfidence(for context: String) -> (hitCount: Int, order: Int, margin: Double) {
         ngramLanguageModel.confidence(for: context)
+    }
+
+    func marginalFrequencyBoost(for word: String, globalProbability: Double) -> Double {
+        ngramLanguageModel.marginalFrequencyBoost(for: word, globalProbability: globalProbability)
     }
 
     func entry(for word: String) -> EngramEntry? {
@@ -367,24 +427,64 @@ struct Engram: Codable, Equatable {
         )
     }
 
-    private mutating func confirm(_ word: String, sessionName: String, source: EngramEvidenceSource) {
-        let normalized = EngramNormalizer.normalize(word)
-        let tokens = EngramNormalizer.ngramSurfaceTokens(in: word)
-        for token in tokens {
-            ngramLanguageModel.learn(tokens: [token])
+    private static func shouldLearnNGramToken(
+        _ normalized: String,
+        assessment: LearningAssessment
+    ) -> Bool {
+        guard !normalized.isEmpty else { return false }
+        if assessment.isDictionaryWord || EngramNormalizer.isProtectedPersonalToken(normalized) {
+            return true
         }
+        guard EngramNormalizer.isWordLike(normalized) else { return false }
+        guard !isDictionaryNearMiss(assessment) else { return false }
+        return true
+    }
+
+    private static func isDictionaryNearMiss(_ assessment: LearningAssessment) -> Bool {
+        guard let distance = assessment.nearestDictionaryDistance else { return false }
+        return distance <= 2
+    }
+
+    private mutating func confirm(
+        _ word: String,
+        sessionName: String,
+        source: EngramEvidenceSource,
+        assessment: LearningAssessment
+    ) {
+        let normalized = EngramNormalizer.normalize(word)
         guard EngramNormalizer.shouldLearnConfirmed(normalized) else { return }
+        let tokens = EngramNormalizer.ngramSurfaceTokens(in: word)
+
+        // Manual confirmations and genuinely novel words (proper nouns, slang —
+        // not within edit distance 2 of any real word) are trusted explicitly and
+        // confirmed permanently. A word that merely looks like a typo of a real
+        // word (e.g. "sould" near "should") is NOT enshrined from a single undo:
+        // it is recorded as one ordinary typing and stays provisional until it
+        // earns confirmation through repeated real use, so a stray undo can't
+        // permanently pollute the personal dictionary or next-word model.
+        let isTrusted = source == .manual
+            || assessment.isDictionaryWord
+            || !Self.isDictionaryNearMiss(assessment)
 
         var entry = entries[normalized] ?? EngramEntry(word: normalized)
         entry.acceptedCount += 1
         entry.lastSeenAt = Date()
         entry.lastEvidenceSource = source
-        entry.confirmationSource = source
-        entry.learningState = .confirmed
         entry.sessionHints.insert(sessionName)
         if entry.vector.isEmpty,
            let vector = PersonalEngramEmbedder.shared.vector(for: normalized) {
             entry.vector = vector
+        }
+
+        if isTrusted {
+            for token in tokens {
+                ngramLanguageModel.learn(tokens: [token])
+            }
+            entry.confirmationSource = source
+            entry.learningState = .confirmed
+        } else {
+            applyTypedEvidence(to: &entry, now: entry.lastSeenAt)
+            entry.learningState = promotionState(for: entry, assessment: assessment)
         }
         entries[normalized] = entry
         pruneEntriesIfNeeded()
@@ -730,7 +830,7 @@ enum EngramNormalizer {
         protectedPersonalTokens.contains(word)
     }
 
-    nonisolated private static func isWordLike(_ word: String) -> Bool {
+    nonisolated static func isWordLike(_ word: String) -> Bool {
         word.rangeOfCharacter(from: .letters) != nil
             && word.rangeOfCharacter(from: CharacterSet.letters.union(CharacterSet(charactersIn: "'")).inverted) == nil
     }

@@ -32,8 +32,31 @@ final class AtlasSessionStore {
             let encrypted = try encrypt(encoded)
             try encrypted.write(to: fileURL, options: [.atomic, .completeFileProtection])
         } catch {
-            assertionFailure("Failed to save ATLAS sessions: \(error)")
+            // Writing to the shared App Group container fails with a permission error when the
+            // keyboard extension runs without Full Access. Persistence is best-effort, so degrade
+            // quietly for that expected case and only trap on genuinely unexpected failures.
+            if Self.isPermissionError(error) {
+                NSLog("Keygram: skipped ATLAS session save; shared container not writable (Full Access off)")
+            } else {
+                assertionFailure("Failed to save ATLAS sessions: \(error)")
+            }
         }
+    }
+
+    private static func isPermissionError(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        if nsError.domain == NSCocoaErrorDomain,
+           nsError.code == NSFileWriteNoPermissionError || nsError.code == NSFileWriteVolumeReadOnlyError {
+            return true
+        }
+        if nsError.domain == NSPOSIXErrorDomain,
+           nsError.code == Int(EPERM) || nsError.code == Int(EACCES) {
+            return true
+        }
+        if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError {
+            return isPermissionError(underlying)
+        }
+        return false
     }
 
     func activeSession(named name: String?) -> AtlasSession {

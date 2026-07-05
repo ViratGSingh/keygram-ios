@@ -46,6 +46,10 @@ enum AtlasSuggestionKind: String {
     case correction
     case personal
     case undoAutocorrection
+    /// A call-to-action shown in place of next-word predictions when the keyboard
+    /// extension lacks Full Access (which the next-word model requires). Tapping it
+    /// routes the user to Settings instead of inserting text.
+    case enableFullAccess
 }
 
 private struct NextWordCandidateFeatures {
@@ -56,7 +60,10 @@ private struct NextWordCandidateFeatures {
     var effortScore: Double = 0
     var recencyBoost: Double = 0
     var baseFrequencyScore: Double = 0
+    var marginalPersonalizationBoost: Double = 0
+    var feedbackBoost: Double = 0
     var isPhrase: Bool = false
+    var isEngramSourced: Bool = false
 
     mutating func absorbPersonalCandidate(_ candidate: PersonalNGramCandidate, weight: Double = 1.0) {
         let weightedLogProbability = candidate.logProbability - max(0, 1.0 - weight) * 0.65
@@ -66,7 +73,27 @@ private struct NextWordCandidateFeatures {
         effortScore = max(effortScore, candidate.effortScore * weight)
         recencyBoost = max(recencyBoost, candidate.recencyBoost * weight)
         isPhrase = isPhrase || candidate.isPhrase
+        isEngramSourced = true
     }
+}
+
+private struct CandidatePrefixState {
+    var inferenceState: AtlasInferenceState
+    var logits: [Float]
+    var logNormalizer: Double
+    var cumulativeLogProbability: Double
+}
+
+private struct NeuralWordBeam {
+    var tokenIDs: [Int]
+    var text: String
+    var rawLogProbability: Double
+}
+
+private struct RankedNextWordCandidate {
+    var suggestion: AtlasSuggestion
+    var isPhrase: Bool
+    var diagnostic: String
 }
 
 final class AtlasInferenceEngine {
@@ -83,7 +110,7 @@ final class AtlasInferenceEngine {
         modelBundle = try? AtlasModelBundle.resolve(in: bundle)
         self.runtime = runtime
         self.tokenizer = tokenizer
-        vocabulary = AtlasVocabularyIndex(bundle: bundle, extraWords: tokenizer.vocabularyWords())
+        vocabulary = AtlasVocabularyIndex(bundle: bundle)
     }
 
     var isModelBundleAvailable: Bool {
@@ -120,7 +147,13 @@ final class AtlasInferenceEngine {
         resetCurrentDraftMemory()
     }
 
-    func suggestions(for context: String, session: AtlasSession, globalEngram: Engram) -> [AtlasSuggestion] {
+    func suggestions(
+        for context: String, 
+        session: AtlasSession,
+        globalEngram: Engram,
+        feedback: NextWordFeedbackSnapshot = NextWordFeedbackSnapshot(),
+        neuralOnly: Bool = false
+    ) -> [AtlasSuggestion] {
         if !context.hasPrefix(lastProcessedContext) {
             resetCurrentDraftMemory()
         }
@@ -139,20 +172,48 @@ final class AtlasInferenceEngine {
             )
         }
 
-        let shortlist = nextWordShortlist(for: context, session: session, globalEngram: globalEngram)
+        let shortlist = applyingFeedback(
+            to: applyingMarginalPersonalization(
+                to: nextWordShortlist(for: context, session: session, globalEngram: globalEngram),
+                session: session,
+                globalEngram: globalEngram
+            ),
+            context: context,
+            feedback: feedback
+        )
         guard !shortlist.isEmpty else {
             return fallbackNextWordSuggestions(context: context, session: session, globalEngram: globalEngram)
         }
 
-        if shouldSkipAtlasRerank(shortlist) {
+        if !neuralOnly, shouldSkipAtlasRerank(shortlist) {
             return rankNextWordShortlist(shortlist, atlasScores: [:], atlasWasAvailable: false)
         }
 
         advanceRuntime(to: context)
-        let atlasScores = lastRuntimeLogits.map {
-            tokenizer.candidateScores(from: $0, candidates: Array(shortlist.keys))
-        } ?? [:]
-        return rankNextWordShortlist(shortlist, atlasScores: atlasScores, atlasWasAvailable: runtime != nil)
+        let neuralResult = lastRuntimeLogits.map {
+            neuralCandidatesAndScores(from: $0, shortlist: shortlist)
+        }
+        let expandedShortlist = applyingFeedback(
+            to: applyingMarginalPersonalization(
+                to: neuralResult?.shortlist ?? shortlist,
+                session: session,
+                globalEngram: globalEngram
+            ),
+            context: context,
+            feedback: feedback
+        )
+        let atlasScores = neuralResult?.scores ?? [:]
+        let suggestions = neuralOnly
+            ? rankNeuralOnly(atlasScores)
+            : rankNextWordShortlist(
+                expandedShortlist,
+                atlasScores: atlasScores,
+                atlasWasAvailable: runtime != nil
+            )
+        logInference(
+            "next-word mode=\(neuralOnly ? "neural-only" : "blended") top=\(suggestions.map(\.text).joined(separator: ",")) neural=\(topLogitSummary(atlasScores))"
+        )
+        return suggestions
     }
 
     private func advanceRuntime(to context: String) {
@@ -217,6 +278,7 @@ final class AtlasInferenceEngine {
             var feature = feature(for: entry.word)
             feature.effortScore = max(feature.effortScore, min(1.0, log(Double(entry.acceptedCount + 1)) * 0.24))
             feature.recencyBoost = max(feature.recencyBoost, session.engram.bias(for: entry.word, context: context) * 0.2)
+            feature.isEngramSourced = true
             store(feature)
         }
 
@@ -251,41 +313,100 @@ final class AtlasInferenceEngine {
         atlasWasAvailable: Bool
     ) -> [AtlasSuggestion] {
         let bestAtlasScore = atlasScores.values.max()
-        let ranked = shortlist.values.map { feature -> (suggestion: AtlasSuggestion, isPhrase: Bool) in
+        if atlasWasAvailable, bestAtlasScore != nil {
+            let rejectedUnsupported = shortlist.values
+                .filter { atlasScores[$0.text] == nil && $0.personalOrder < 2 }
+                .sorted { preAtlasScore($0) > preAtlasScore($1) }
+                .prefix(12)
+                .map {
+                    String(
+                        format: "%@ personal=%.3f order=%d hits=%d marginal=%.3f feedback=%.3f",
+                        $0.text,
+                        personalEvidenceScore($0),
+                        $0.personalOrder,
+                        $0.personalHitCount,
+                        $0.marginalPersonalizationBoost,
+                        $0.feedbackBoost
+                    )
+                }
+            if !rejectedUnsupported.isEmpty {
+                logInference("candidate-rejected-no-neural " + rejectedUnsupported.joined(separator: " | "))
+            }
+        }
+
+        let ranked = shortlist.values.compactMap { feature -> RankedNextWordCandidate? in
+            let rawAtlasScore = atlasScores[feature.text]
+            let hasAtlasScore = rawAtlasScore != nil
+            if atlasWasAvailable,
+               bestAtlasScore != nil,
+               !hasAtlasScore,
+               feature.personalOrder < 2 {
+                return nil
+            }
+
             let weights = interpolationWeights(for: feature, atlasWasAvailable: atlasWasAvailable && bestAtlasScore != nil)
             let personalScore = personalEvidenceScore(feature)
-            let atlasScore = atlasScores[feature.text].map { rawScore -> Double in
+            let atlasScore = rawAtlasScore.map { rawScore -> Double in
                 guard let bestAtlasScore else { return -4.0 }
                 return max(-4.0, rawScore - bestAtlasScore)
-            } ?? 0
+            } ?? (atlasWasAvailable ? -4.0 : 0)
             let baseScore = feature.baseFrequencyScore > 0
                 ? log(max(0.0001, feature.baseFrequencyScore))
                 : 0
             let contextualPersonalBoost = feature.personalOrder >= 2
                 ? 0.8 + min(0.6, log(Double(feature.personalHitCount + 1)) * 0.35)
                 : 0
+            let supplementalLimit = feature.personalOrder >= 2 ? 0.85 : 0.3
+            let supplementalBoost = max(
+                -supplementalLimit,
+                min(
+                    supplementalLimit,
+                    feature.marginalPersonalizationBoost + feature.feedbackBoost
+                )
+            )
 
             let score = personalScore * weights.personal
                 + atlasScore * weights.atlas
                 + baseScore * weights.baseFrequency
                 + feature.effortScore * weights.effort
                 + feature.recencyBoost * weights.recency
+                + supplementalBoost
                 + contextualPersonalBoost
                 + (feature.isPhrase ? 0.06 : 0)
 
-            return (
-                AtlasSuggestion(
+            let diagnostic = String(
+                format: "%@ total=%.3f neuralRaw=%@ neuralRel=%.3f personal=%.3f order=%d hits=%d base=%.3f marginal=%.3f feedback=%.3f supplemental=%.3f context=%.3f",
+                feature.text,
+                score,
+                rawAtlasScore.map { String(format: "%.3f", $0) } ?? "none",
+                atlasScore,
+                personalScore,
+                feature.personalOrder,
+                feature.personalHitCount,
+                baseScore,
+                feature.marginalPersonalizationBoost,
+                feature.feedbackBoost,
+                supplementalBoost,
+                contextualPersonalBoost
+            )
+
+            return RankedNextWordCandidate(
+                suggestion: AtlasSuggestion(
                     text: feature.text,
-                    kind: feature.personalHitCount > 0 || feature.effortScore > 0.2 ? .personal : .nextWord,
+                    kind: feature.isEngramSourced ? .personal : .nextWord,
                     score: score
                 ),
-                feature.isPhrase
+                isPhrase: feature.isPhrase,
+                diagnostic: diagnostic
             )
         }
 
         let deduped = Dictionary(grouping: ranked, by: { $0.suggestion.text.lowercased() })
             .compactMap { $0.value.max { $0.suggestion.score < $1.suggestion.score } }
             .sorted { $0.suggestion.score > $1.suggestion.score }
+        logInference(
+            "candidate-scores " + deduped.prefix(12).map(\.diagnostic).joined(separator: " | ")
+        )
 
         var result: [AtlasSuggestion] = []
         var includedPhrase = false
@@ -300,6 +421,390 @@ final class AtlasInferenceEngine {
             }
         }
         return result
+    }
+
+    private func rankNeuralOnly(_ atlasScores: [String: Double]) -> [AtlasSuggestion] {
+        let ranked = atlasScores
+            .filter { isUsableNextWordCandidate($0.key) }
+            .sorted { $0.value > $1.value }
+        logInference(
+            "candidate-scores neural-only " + ranked.prefix(12)
+                .map { "\($0.key)=\(String(format: "%.3f", $0.value))" }
+                .joined(separator: " | ")
+        )
+        return ranked.prefix(AtlasConfiguration.maxSuggestions).map {
+            AtlasSuggestion(text: $0.key, kind: .nextWord, score: $0.value)
+        }
+    }
+
+    private func neuralCandidatesAndScores(
+        from logits: [Float],
+        shortlist: [String: NextWordCandidateFeatures]
+    ) -> (shortlist: [String: NextWordCandidateFeatures], scores: [String: Double]) {
+        guard let runtime, !logits.isEmpty else { return (shortlist, [:]) }
+
+        var expanded = shortlist
+        let baseLogNormalizer = logSumExp(logits)
+        let baseState = CandidatePrefixState(
+            inferenceState: state,
+            logits: logits,
+            logNormalizer: baseLogNormalizer,
+            cumulativeLogProbability: 0
+        )
+        var prefixCache: [[Int]: CandidatePrefixState] = [[]: baseState]
+        var remainingStepBudget = AtlasConfiguration.exactNeuralRescoreStepBudget
+        var beamStepBudget = min(
+            AtlasConfiguration.neuralWordBeamStepBudget,
+            remainingStepBudget
+        )
+        let initialBeamStepBudget = beamStepBudget
+        var scores: [String: Double] = [:]
+
+        var initialBeams: [NeuralWordBeam] = []
+        for tokenID in topTokenIDs(
+            from: logits,
+            limit: AtlasConfiguration.neuralNextWordCandidateLimit * 4
+        ) {
+            guard let piece = tokenizer.tokenPiece(forTokenID: tokenID),
+                  let word = startingWord(from: piece)
+            else {
+                continue
+            }
+
+            let rawScore = Double(logits[tokenID]) - baseLogNormalizer
+            if vocabulary.contains(word), isUsableNextWordCandidate(word) {
+                scores[word] = max(scores[word] ?? -.infinity, rawScore)
+                if expanded[word] == nil {
+                    expanded[word] = NextWordCandidateFeatures(text: word)
+                }
+            }
+            initialBeams.append(NeuralWordBeam(tokenIDs: [tokenID], text: word, rawLogProbability: rawScore))
+            if initialBeams.count == AtlasConfiguration.neuralNextWordCandidateLimit {
+                break
+            }
+        }
+
+        var beams = Array(
+            initialBeams
+                .sorted { $0.rawLogProbability > $1.rawLogProbability }
+                .prefix(AtlasConfiguration.neuralWordBeamWidth)
+        )
+        for _ in 1..<AtlasConfiguration.neuralWordBeamDepth {
+            var nextBeams: [NeuralWordBeam] = []
+            for beam in beams {
+                guard let prefixState = candidatePrefixState(
+                    after: beam.tokenIDs,
+                    runtime: runtime,
+                    prefixCache: &prefixCache,
+                    remainingStepBudget: &beamStepBudget
+                ) else {
+                    continue
+                }
+
+                for tokenID in topTokenIDs(
+                    from: prefixState.logits,
+                    limit: AtlasConfiguration.neuralWordBeamWidth * 8
+                ) {
+                    guard let piece = tokenizer.tokenPiece(forTokenID: tokenID),
+                          !piece.hasPrefix("\u{2581}"),
+                          let text = appendingContinuationPiece(piece, to: beam.text)
+                    else {
+                        continue
+                    }
+
+                    let rawScore = prefixState.cumulativeLogProbability
+                        + Double(prefixState.logits[tokenID])
+                        - prefixState.logNormalizer
+                    let tokenIDs = beam.tokenIDs + [tokenID]
+                    let candidate = NeuralWordBeam(
+                        tokenIDs: tokenIDs,
+                        text: text,
+                        rawLogProbability: rawScore
+                    )
+                    nextBeams.append(candidate)
+
+                    if vocabulary.contains(text), isUsableNextWordCandidate(text) {
+                        if expanded[text] == nil {
+                            expanded[text] = NextWordCandidateFeatures(text: text)
+                        }
+                    }
+                }
+            }
+
+            guard !nextBeams.isEmpty else { break }
+            beams = Array(
+                nextBeams
+                    .sorted {
+                        normalizedSequenceScore($0.rawLogProbability, tokenCount: $0.tokenIDs.count)
+                            > normalizedSequenceScore($1.rawLogProbability, tokenCount: $1.tokenIDs.count)
+                    }
+                    .prefix(AtlasConfiguration.neuralWordBeamWidth)
+            )
+        }
+        remainingStepBudget -= initialBeamStepBudget - beamStepBudget
+
+        let tokenized = expanded.values.compactMap { feature -> (feature: NextWordCandidateFeatures, tokenIDs: [Int])? in
+            let tokenIDs = tokenizer.tokenIDs(forWord: feature.text)
+            guard !tokenIDs.isEmpty,
+                  tokenIDs.count <= AtlasConfiguration.exactNeuralRescoreTokenLimit,
+                  tokenIDs.allSatisfy({ logits.indices.contains($0) })
+            else {
+                return nil
+            }
+            return (feature, tokenIDs)
+        }
+
+        var multiTokenCandidates: [(feature: NextWordCandidateFeatures, tokenIDs: [Int], firstTokenScore: Double)] = []
+
+        for candidate in tokenized {
+            let firstTokenScore = Double(logits[candidate.tokenIDs[0]]) - baseLogNormalizer
+            if candidate.tokenIDs.count == 1 {
+                scores[candidate.feature.text] = max(scores[candidate.feature.text] ?? -.infinity, firstTokenScore)
+            } else {
+                multiTokenCandidates.append((candidate.feature, candidate.tokenIDs, firstTokenScore))
+            }
+        }
+
+        let candidatesToRescore = multiTokenCandidates
+            .sorted {
+                neuralRescoreShortlistScore(firstTokenScore: $0.firstTokenScore, feature: $0.feature)
+                    > neuralRescoreShortlistScore(firstTokenScore: $1.firstTokenScore, feature: $1.feature)
+            }
+            .prefix(AtlasConfiguration.exactNeuralRescoreCandidateLimit)
+
+        for candidate in candidatesToRescore {
+            if let score = exactSequenceLogProbability(
+                tokenIDs: candidate.tokenIDs,
+                runtime: runtime,
+                prefixCache: &prefixCache,
+                remainingStepBudget: &remainingStepBudget
+            ) {
+                scores[candidate.feature.text] = score
+            }
+        }
+
+        return (expanded, scores)
+    }
+
+    private func applyingMarginalPersonalization(
+        to shortlist: [String: NextWordCandidateFeatures],
+        session: AtlasSession,
+        globalEngram: Engram
+    ) -> [String: NextWordCandidateFeatures] {
+        var personalized = shortlist
+        for word in personalized.keys {
+            guard var feature = personalized[word] else { continue }
+            let globalProbability = vocabulary.frequencyProbability(for: word)
+            feature.marginalPersonalizationBoost = session.engram.marginalFrequencyBoost(
+                for: word,
+                globalProbability: globalProbability
+            ) + globalEngram.marginalFrequencyBoost(
+                for: word,
+                globalProbability: globalProbability
+            ) * 0.65
+            personalized[word] = feature
+        }
+        return personalized
+    }
+
+    private func applyingFeedback(
+        to shortlist: [String: NextWordCandidateFeatures],
+        context: String,
+        feedback: NextWordFeedbackSnapshot
+    ) -> [String: NextWordCandidateFeatures] {
+        var reranked = shortlist
+        for word in reranked.keys {
+            guard var feature = reranked[word] else { continue }
+            feature.feedbackBoost = feedback.rankingBoost(for: word, context: context)
+            reranked[word] = feature
+        }
+        return reranked
+    }
+
+    private func neuralRescoreShortlistScore(
+        firstTokenScore: Double,
+        feature: NextWordCandidateFeatures
+    ) -> Double {
+        firstTokenScore + preAtlasScore(feature) * 0.2
+    }
+
+    private func exactSequenceLogProbability(
+        tokenIDs: [Int],
+        runtime: AtlasModelRuntime,
+        prefixCache: inout [[Int]: CandidatePrefixState],
+        remainingStepBudget: inout Int
+    ) -> Double? {
+        guard !tokenIDs.isEmpty, var prefixState = prefixCache[[]] else { return nil }
+        var prefix: [Int] = []
+
+        for (index, tokenID) in tokenIDs.enumerated() {
+            guard prefixState.logits.indices.contains(tokenID) else { return nil }
+            let sequenceScore = prefixState.cumulativeLogProbability
+                + Double(prefixState.logits[tokenID])
+                - prefixState.logNormalizer
+            prefix.append(tokenID)
+
+            if index == tokenIDs.count - 1 {
+                return sequenceScore
+            }
+
+            if let cachedState = prefixCache[prefix] {
+                prefixState = cachedState
+                continue
+            }
+
+            guard let nextPrefixState = advanceCandidatePrefix(
+                tokenID: tokenID,
+                sequenceScore: sequenceScore,
+                from: prefixState,
+                runtime: runtime,
+                remainingStepBudget: &remainingStepBudget
+            ) else { return nil }
+            prefixCache[prefix] = nextPrefixState
+            prefixState = nextPrefixState
+        }
+
+        return nil
+    }
+
+    private func candidatePrefixState(
+        after tokenIDs: [Int],
+        runtime: AtlasModelRuntime,
+        prefixCache: inout [[Int]: CandidatePrefixState],
+        remainingStepBudget: inout Int
+    ) -> CandidatePrefixState? {
+        guard var prefixState = prefixCache[[]] else { return nil }
+        var prefix: [Int] = []
+
+        for tokenID in tokenIDs {
+            prefix.append(tokenID)
+            if let cached = prefixCache[prefix] {
+                prefixState = cached
+                continue
+            }
+            guard prefixState.logits.indices.contains(tokenID) else { return nil }
+            let sequenceScore = prefixState.cumulativeLogProbability
+                + Double(prefixState.logits[tokenID])
+                - prefixState.logNormalizer
+            guard let next = advanceCandidatePrefix(
+                tokenID: tokenID,
+                sequenceScore: sequenceScore,
+                from: prefixState,
+                runtime: runtime,
+                remainingStepBudget: &remainingStepBudget
+            ) else { return nil }
+            prefixCache[prefix] = next
+            prefixState = next
+        }
+
+        return prefixState
+    }
+
+    private func advanceCandidatePrefix(
+        tokenID: Int,
+        sequenceScore: Double,
+        from prefixState: CandidatePrefixState,
+        runtime: AtlasModelRuntime,
+        remainingStepBudget: inout Int
+    ) -> CandidatePrefixState? {
+        guard remainingStepBudget > 0 else { return nil }
+        remainingStepBudget -= 1
+
+        var branchState = prefixState.inferenceState
+        if branchState.positionID >= Int64(AtlasConfiguration.maxContextTokens) {
+            branchState = AtlasInferenceState()
+        }
+
+        do {
+            let output = try runtime.step(
+                AtlasModelStepInput(
+                    tokenID: Int64(tokenID),
+                    positionID: branchState.positionID,
+                    kvCache: branchState.kvCache,
+                    glaState: branchState.glaState
+                )
+            )
+            branchState.positionID += 1
+            branchState.kvCache = output.kvCache
+            branchState.glaState = output.glaState
+            return CandidatePrefixState(
+                inferenceState: branchState,
+                logits: output.logits,
+                logNormalizer: logSumExp(output.logits),
+                cumulativeLogProbability: sequenceScore
+            )
+        } catch {
+            logInference("candidate prefix inference failed: \(error)")
+            return nil
+        }
+    }
+
+    private func normalizedSequenceScore(_ rawScore: Double, tokenCount: Int) -> Double {
+        guard tokenCount > 1 else { return rawScore }
+        return rawScore / pow(
+            Double(tokenCount),
+            AtlasConfiguration.neuralLengthNormalizationExponent
+        )
+    }
+
+    private func topTokenIDs(from logits: [Float], limit: Int) -> [Int] {
+        guard limit > 0 else { return [] }
+        var best: [(id: Int, logit: Float)] = []
+        best.reserveCapacity(limit)
+
+        for (id, logit) in logits.enumerated() {
+            if best.count < limit {
+                best.append((id, logit))
+                if best.count == limit {
+                    best.sort { $0.logit > $1.logit }
+                }
+                continue
+            }
+            guard let last = best.last, logit > last.logit else { continue }
+            best[best.count - 1] = (id, logit)
+            var index = best.count - 1
+            while index > 0, best[index].logit > best[index - 1].logit {
+                best.swapAt(index, index - 1)
+                index -= 1
+            }
+        }
+
+        return best.map(\.id)
+    }
+
+    private func appendingContinuationPiece(_ piece: String, to word: String) -> String? {
+        let cleaned = piece.trimmingCharacters(in: CharacterSet.alphanumerics.inverted).lowercased()
+        guard !cleaned.isEmpty,
+              cleaned.rangeOfCharacter(from: .letters) != nil,
+              cleaned.rangeOfCharacter(from: CharacterSet.alphanumerics.inverted) == nil
+        else {
+            return nil
+        }
+        return word + cleaned
+    }
+
+    private func startingWord(from piece: String) -> String? {
+        guard piece.hasPrefix("\u{2581}") else { return nil }
+        let cleaned = piece
+            .replacingOccurrences(of: "\u{2581}", with: "")
+            .trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
+            .lowercased()
+        guard !cleaned.isEmpty,
+              cleaned.rangeOfCharacter(from: .letters) != nil,
+              cleaned.rangeOfCharacter(from: CharacterSet.alphanumerics.inverted) == nil
+        else {
+            return nil
+        }
+        return cleaned
+    }
+
+    private func logSumExp(_ logits: [Float]) -> Double {
+        guard let maximum = logits.max() else { return 0 }
+        let maximumDouble = Double(maximum)
+        let exponentialSum = logits.reduce(0.0) { partialResult, logit in
+            partialResult + exp(Double(logit) - maximumDouble)
+        }
+        return maximumDouble + log(max(exponentialSum, Double.leastNonzeroMagnitude))
     }
 
     private func interpolationWeights(
@@ -344,6 +849,8 @@ final class AtlasInferenceEngine {
             + log(max(0.0001, feature.baseFrequencyScore)) * 0.18
             + feature.effortScore * 0.22
             + feature.recencyBoost * 0.18
+            + feature.marginalPersonalizationBoost
+            + feature.feedbackBoost
             + (feature.isPhrase ? 0.06 : 0)
     }
 

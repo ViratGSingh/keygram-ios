@@ -6,12 +6,17 @@ struct AtlasModelBundle {
 
     static func resolve(in bundle: Bundle = .main) throws -> AtlasModelBundle {
         let modelURL = try resolveResource(
-            candidates: ["atlas_v2_keyboard_q8", "atlas_keyboard_q8"],
+            candidates: [
+                "atlas_v3_keyboard_q8",
+                "altaas_v3_lkeybaord_q8",
+                "atlas_v2_keyboard_q8",
+                "atlas_keyboard_q8"
+            ],
             extension: "onnx",
             in: bundle
         )
         let tokenizerURL = try resolveResource(
-            candidates: ["v2_spm", "v3_spm"],
+            candidates: ["v3_spm", "v2_spm"],
             extension: "model",
             in: bundle
         )
@@ -22,6 +27,9 @@ struct AtlasModelBundle {
     private static func resolveResource(candidates: [String], extension resourceExtension: String, in bundle: Bundle) throws -> URL {
         for candidate in candidates {
             if let url = bundle.url(forResource: candidate, withExtension: resourceExtension) {
+                return url
+            }
+            if let url = bundle.url(forResource: candidate, withExtension: resourceExtension, subdirectory: "Resources") {
                 return url
             }
         }

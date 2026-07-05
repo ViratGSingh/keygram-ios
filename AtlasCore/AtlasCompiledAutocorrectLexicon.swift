@@ -119,8 +119,17 @@ final class AtlasCompiledAutocorrectLexicon {
         try validateIndexes()
     }
 
+    private static let wordFlagProtected: UInt16 = 1
+
     func contains(_ word: String) -> Bool {
         wordID(for: word) != nil
+    }
+
+    /// A romanized-Hindi / non-English word the next-word model knows. Autocorrect
+    /// must leave these alone instead of rewriting them to a nearby English word.
+    func isProtected(_ word: String) -> Bool {
+        guard let id = wordID(for: word) else { return false }
+        return flags(forWordID: id) & Self.wordFlagProtected != 0
     }
 
     func frequency(for word: String) -> Double {
@@ -272,6 +281,11 @@ final class AtlasCompiledAutocorrectLexicon {
         let length = Int(Self.readUInt16(from: data, at: recordOffset + 4))
         let start = stringTableOffset + offset
         return String(decoding: data[start..<(start + length)], as: UTF8.self)
+    }
+
+    private func flags(forWordID id: Int) -> UInt16 {
+        let offset = wordRecordsOffset + id * Self.wordRecordByteCount + 6
+        return Self.readUInt16(from: data, at: offset)
     }
 
     private func frequency(forWordID id: Int) -> Double {

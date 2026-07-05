@@ -77,6 +77,6 @@ struct AtlasFloatTensor: Codable, Equatable {
 enum AtlasTensorShapes {
     static let inputIDs = [1, 1]
     static let positionID = [1]
-    static let emptyKV = [1, 4, 0, 64]
-    static let glaState = [1, 4, 64, 128]
+    static let emptyKV = [1, 4, 0, 32]
+    static let glaState = [1, 4, 32, 80]
 }

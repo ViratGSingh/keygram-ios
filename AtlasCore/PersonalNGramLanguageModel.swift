@@ -45,6 +45,7 @@ struct PersonalNGramLanguageModel: Codable, Equatable {
     private(set) var fourgrams: [String: EngramNGramObservation] = [:]
     private(set) var fivegrams: [String: EngramNGramObservation] = [:]
     private(set) var continuationsByContext: [String: [String: EngramNGramObservation]] = [:]
+    private(set) var phraseContinuationsByContext: [String: [String: EngramNGramObservation]] = [:]
     private(set) var totalUnigramCount: Int = 0
     private(set) var preferredSurfaceForms: [String: String] = [:]
 
@@ -57,6 +58,7 @@ struct PersonalNGramLanguageModel: Codable, Equatable {
         case fourgrams
         case fivegrams
         case continuationsByContext
+        case phraseContinuationsByContext
         case totalUnigramCount
         case preferredSurfaceForms
     }
@@ -72,6 +74,10 @@ struct PersonalNGramLanguageModel: Codable, Equatable {
             [String: [String: EngramNGramObservation]].self,
             forKey: .continuationsByContext
         ) ?? [:]
+        phraseContinuationsByContext = try container.decodeIfPresent(
+            [String: [String: EngramNGramObservation]].self,
+            forKey: .phraseContinuationsByContext
+        ) ?? [:]
         totalUnigramCount = try container.decodeIfPresent(Int.self, forKey: .totalUnigramCount) ?? 0
         preferredSurfaceForms = try container.decodeIfPresent([String: String].self, forKey: .preferredSurfaceForms) ?? [:]
     }
@@ -84,6 +90,7 @@ struct PersonalNGramLanguageModel: Codable, Equatable {
         try container.encode(fourgrams, forKey: .fourgrams)
         try container.encode(fivegrams, forKey: .fivegrams)
         try container.encode(continuationsByContext, forKey: .continuationsByContext)
+        try container.encode(phraseContinuationsByContext, forKey: .phraseContinuationsByContext)
         try container.encode(totalUnigramCount, forKey: .totalUnigramCount)
         try container.encode(preferredSurfaceForms, forKey: .preferredSurfaceForms)
     }
@@ -102,6 +109,7 @@ struct PersonalNGramLanguageModel: Codable, Equatable {
                 observe(ngram, at: now)
             }
         }
+        observePhrases(tokens: tokens, at: now)
 
         pruneIfNeeded()
     }
@@ -115,6 +123,7 @@ struct PersonalNGramLanguageModel: Codable, Equatable {
         for order in 2...min(Constants.maxOrder, tokens.count) {
             observe(Array(tokens.suffix(order)), at: now)
         }
+        observeLatestPhrases(tokens: tokens, at: now)
 
         pruneIfNeeded()
     }
@@ -129,6 +138,11 @@ struct PersonalNGramLanguageModel: Codable, Equatable {
             var existingContinuations = continuationsByContext[context] ?? [:]
             Self.mergeTable(&existingContinuations, incomingContinuations)
             continuationsByContext[context] = existingContinuations
+        }
+        for (context, incomingContinuations) in other.phraseContinuationsByContext {
+            var existingContinuations = phraseContinuationsByContext[context] ?? [:]
+            Self.mergeTable(&existingContinuations, incomingContinuations)
+            phraseContinuationsByContext[context] = existingContinuations
         }
         totalUnigramCount += other.totalUnigramCount
         for (word, surface) in other.preferredSurfaceForms {
@@ -175,45 +189,44 @@ struct PersonalNGramLanguageModel: Codable, Equatable {
 
     func phrasePredictions(for context: String, limit: Int = 6) -> [PersonalNGramCandidate] {
         let contextTokens = EngramNormalizer.ngramTokens(in: context)
-        let firstWords = predictions(for: context, limit: 18)
-            .filter { !$0.isPhrase && $0.order >= 3 && $0.hitCount >= 3 }
-
+        guard contextTokens.count >= AtlasConfiguration.personalPhraseMinimumContextWords else {
+            return []
+        }
         var phrases: [PersonalNGramCandidate] = []
-        for first in firstWords {
-            let secondContext = contextTokens + [EngramNormalizer.normalize(first.text)]
-            guard let second = bestContinuation(after: secondContext),
-                  second.order >= 3,
-                  second.hitCount >= 3
-            else {
+
+        for contextLength in stride(
+            from: min(4, contextTokens.count),
+            through: AtlasConfiguration.personalPhraseMinimumContextWords,
+            by: -1
+        ) {
+            let contextKey = Self.key(for: Array(contextTokens.suffix(contextLength)))
+            guard let continuations = phraseContinuationsByContext[contextKey], !continuations.isEmpty else {
                 continue
             }
-
-            let phraseText = first.text + " " + second.text
-            let phraseScore = first.logProbability + second.logProbability + 0.28
-            phrases.append(
-                PersonalNGramCandidate(
-                    text: phraseText,
-                    logProbability: phraseScore,
-                    order: max(first.order, second.order),
-                    hitCount: min(first.hitCount, second.hitCount),
-                    recencyBoost: max(first.recencyBoost, second.recencyBoost),
-                    effortScore: min(1.2, first.effortScore + second.effortScore * 0.55),
-                    isPhrase: true
-                )
-            )
-
-            let thirdContext = secondContext + [EngramNormalizer.normalize(second.text)]
-            if let third = bestContinuation(after: thirdContext),
-               third.order >= 4,
-               third.hitCount >= 4 {
+            let total = max(1, continuations.values.reduce(0) { $0 + $1.count })
+            for (phraseKey, observation) in continuations {
+                guard observation.count >= AtlasConfiguration.personalPhraseMinimumCount else { continue }
+                let normalizedWords = phraseKey.components(separatedBy: Constants.separator)
+                guard !Self.phraseOverlapsContextSuffix(
+                    normalizedWords,
+                    contextTokens: contextTokens
+                ) else {
+                    continue
+                }
+                let surfaceWords = normalizedWords.map { preferredSurfaceForms[$0] ?? $0 }
+                let discountedCount = max(0.1, Double(observation.count) - Constants.katzDiscount)
                 phrases.append(
                     PersonalNGramCandidate(
-                        text: phraseText + " " + third.text,
-                        logProbability: phraseScore + third.logProbability + 0.16,
-                        order: max(second.order, third.order),
-                        hitCount: min(first.hitCount, second.hitCount, third.hitCount),
-                        recencyBoost: max(first.recencyBoost, second.recencyBoost, third.recencyBoost),
-                        effortScore: min(1.35, first.effortScore + second.effortScore * 0.45 + third.effortScore * 0.35),
+                        text: surfaceWords.joined(separator: " "),
+                        logProbability: log(max(1e-9, discountedCount / Double(total))),
+                        order: contextLength + normalizedWords.count,
+                        hitCount: observation.count,
+                        recencyBoost: Self.recencyBoost(for: observation.lastSeenAt),
+                        effortScore: min(
+                            1.35,
+                            log(Double(observation.count + 1)) * 0.28
+                                + Double(normalizedWords.count) * 0.12
+                        ),
                         isPhrase: true
                     )
                 )
@@ -233,6 +246,50 @@ struct PersonalNGramLanguageModel: Codable, Equatable {
         guard let best = candidates.first else { return (0, 0, 0) }
         let runnerUpScore = candidates.dropFirst().first.map(rankingScore) ?? -.infinity
         return (best.hitCount, best.order, rankingScore(best) - runnerUpScore)
+    }
+
+    func marginalFrequencyBoost(for word: String, globalProbability: Double) -> Double {
+        let normalized = EngramNormalizer.normalize(word)
+        let personalCount = unigrams[normalized]?.count ?? 0
+        guard personalCount >= AtlasConfiguration.marginalPersonalizationMinimumCount else { return 0 }
+
+        let globalProbability = max(globalProbability, 1e-9)
+        let priorStrength = AtlasConfiguration.marginalPersonalizationPriorStrength
+        let smoothedPersonalProbability = (
+            Double(personalCount) + priorStrength * globalProbability
+        ) / Double(max(totalUnigramCount, 1) + Int(priorStrength))
+        let evidence = min(1.0, log(Double(personalCount + 1)) / log(9.0))
+        let rawBoost = log(max(smoothedPersonalProbability, 1e-9) / globalProbability)
+            * AtlasConfiguration.marginalPersonalizationStrength
+            * evidence
+        return min(
+            AtlasConfiguration.marginalPersonalizationMaximumBoost,
+            max(-AtlasConfiguration.marginalPersonalizationMaximumBoost, rawBoost)
+        )
+    }
+
+    func learnedWords() -> [String] {
+        Array(unigrams.keys)
+    }
+
+    mutating func removeWords(_ words: Set<String>) {
+        let blockedWords = Set(words.map(EngramNormalizer.normalize).filter { !$0.isEmpty })
+        guard !blockedWords.isEmpty else { return }
+
+        let removedUnigramCount = unigrams
+            .filter { blockedWords.contains($0.key) }
+            .values
+            .reduce(0) { $0 + $1.count }
+        totalUnigramCount = max(0, totalUnigramCount - removedUnigramCount)
+
+        unigrams = unigrams.filter { !blockedWords.contains($0.key) }
+        bigrams = bigrams.filter { !Self.keyContainsAny($0.key, in: blockedWords) }
+        trigrams = trigrams.filter { !Self.keyContainsAny($0.key, in: blockedWords) }
+        fourgrams = fourgrams.filter { !Self.keyContainsAny($0.key, in: blockedWords) }
+        fivegrams = fivegrams.filter { !Self.keyContainsAny($0.key, in: blockedWords) }
+        continuationsByContext = Self.removingWords(blockedWords, from: continuationsByContext)
+        phraseContinuationsByContext = Self.removingWords(blockedWords, from: phraseContinuationsByContext)
+        preferredSurfaceForms = preferredSurfaceForms.filter { !blockedWords.contains($0.key) }
     }
 
     private mutating func observe(_ ngram: [String], at date: Date) {
@@ -264,6 +321,49 @@ struct PersonalNGramLanguageModel: Codable, Equatable {
         var continuations = continuationsByContext[contextKey] ?? [:]
         Self.increment(&continuations, key: word, at: date)
         continuationsByContext[contextKey] = continuations
+    }
+
+    private mutating func observePhrases(tokens: [String], at date: Date) {
+        guard tokens.count >= 3 else { return }
+        for continuationStart in 1..<tokens.count {
+            for continuationLength in 2...3 {
+                let continuationEnd = continuationStart + continuationLength
+                guard continuationEnd <= tokens.count else { break }
+                let maximumContextLength = min(4, continuationStart)
+                guard maximumContextLength >= AtlasConfiguration.personalPhraseMinimumContextWords else {
+                    continue
+                }
+                for contextLength in AtlasConfiguration.personalPhraseMinimumContextWords...maximumContextLength {
+                    let context = Array(tokens[(continuationStart - contextLength)..<continuationStart])
+                    let continuation = Array(tokens[continuationStart..<continuationEnd])
+                    addPhraseContinuation(continuation, after: context, at: date)
+                }
+            }
+        }
+    }
+
+    private mutating func observeLatestPhrases(tokens: [String], at date: Date) {
+        guard tokens.count >= 3 else { return }
+        for continuationLength in 2...min(3, tokens.count - 1) {
+            let continuationStart = tokens.count - continuationLength
+            let maximumContextLength = min(4, continuationStart)
+            guard maximumContextLength >= AtlasConfiguration.personalPhraseMinimumContextWords else {
+                continue
+            }
+            for contextLength in AtlasConfiguration.personalPhraseMinimumContextWords...maximumContextLength {
+                let context = Array(tokens[(continuationStart - contextLength)..<continuationStart])
+                let continuation = Array(tokens.suffix(continuationLength))
+                addPhraseContinuation(continuation, after: context, at: date)
+            }
+        }
+    }
+
+    private mutating func addPhraseContinuation(_ phrase: [String], after context: [String], at date: Date) {
+        let contextKey = Self.key(for: context)
+        let phraseKey = Self.key(for: phrase)
+        var continuations = phraseContinuationsByContext[contextKey] ?? [:]
+        Self.increment(&continuations, key: phraseKey, at: date)
+        phraseContinuationsByContext[contextKey] = continuations
     }
 
     private func addContinuations(
@@ -361,6 +461,33 @@ struct PersonalNGramLanguageModel: Codable, Equatable {
             + (candidate.isPhrase ? 0.22 : 0)
     }
 
+    nonisolated private static func phraseOverlapsContextSuffix(
+        _ phraseTokens: [String],
+        contextTokens: [String]
+    ) -> Bool {
+        guard let firstPhraseToken = phraseTokens.first,
+              let lastContextToken = contextTokens.last
+        else {
+            return false
+        }
+        if firstPhraseToken == lastContextToken {
+            return true
+        }
+
+        let maximumOverlap = min(3, phraseTokens.count, contextTokens.count)
+        guard maximumOverlap >= 2 else { return false }
+        for overlapLength in stride(from: maximumOverlap, through: 2, by: -1) {
+            let contextSuffix = Array(contextTokens.suffix(overlapLength))
+            for start in 0...(phraseTokens.count - overlapLength) {
+                let end = start + overlapLength
+                if Array(phraseTokens[start..<end]) == contextSuffix {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
     nonisolated private static func observationRank(_ observation: EngramNGramObservation) -> Double {
         Double(observation.count) + recencyBoost(for: observation.lastSeenAt) * 2.0
     }
@@ -412,6 +539,26 @@ struct PersonalNGramLanguageModel: Codable, Equatable {
             continuationsByContext[context] = continuations
         }
 
+        if phraseContinuationsByContext.count > AtlasConfiguration.personalPhraseMaxContexts {
+            let keptContextKeys = Set(
+                phraseContinuationsByContext
+                    .sorted { Self.contextRank($0.value) > Self.contextRank($1.value) }
+                    .prefix(AtlasConfiguration.personalPhraseMaxContexts)
+                    .map(\.key)
+            )
+            phraseContinuationsByContext = phraseContinuationsByContext.filter {
+                keptContextKeys.contains($0.key)
+            }
+        }
+        for context in phraseContinuationsByContext.keys {
+            var continuations = phraseContinuationsByContext[context] ?? [:]
+            Self.prune(
+                &continuations,
+                limit: AtlasConfiguration.personalPhraseMaxContinuationsPerContext
+            )
+            phraseContinuationsByContext[context] = continuations
+        }
+
         preferredSurfaceForms = preferredSurfaceForms.filter { unigrams[$0.key] != nil }
     }
 
@@ -450,6 +597,27 @@ struct PersonalNGramLanguageModel: Codable, Equatable {
 
     nonisolated private static func contextRank(_ continuations: [String: EngramNGramObservation]) -> Double {
         continuations.values.reduce(0) { $0 + observationRank($1) }
+    }
+
+    nonisolated private static func keyContainsAny(_ key: String, in words: Set<String>) -> Bool {
+        key.components(separatedBy: Constants.separator).contains { words.contains($0) }
+    }
+
+    nonisolated private static func removingWords(
+        _ words: Set<String>,
+        from table: [String: [String: EngramNGramObservation]]
+    ) -> [String: [String: EngramNGramObservation]] {
+        var cleaned: [String: [String: EngramNGramObservation]] = [:]
+        for (context, continuations) in table {
+            guard !keyContainsAny(context, in: words) else { continue }
+            let filtered = continuations.filter { entry in
+                !keyContainsAny(entry.key, in: words)
+            }
+            if !filtered.isEmpty {
+                cleaned[context] = filtered
+            }
+        }
+        return cleaned
     }
 
     nonisolated private static func key(for tokens: [String]) -> String {

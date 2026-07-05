@@ -51,6 +51,7 @@ final class AtlasAutocorrectEngine {
         let quickLexicon = AtlasQuickSplitLexicon.shared(bundle: bundle)
         guard quickLexicon.isAvailable else { return nil }
         guard !quickLexicon.isDictionaryWord(normalized) else { return nil }
+        guard !quickLexicon.isProtected(normalized) else { return nil }
         guard let decision = quickSplitCorrection(for: normalized, lexicon: quickLexicon) else { return nil }
         if quickLexicon.hasDictionaryWordNear(normalized, maxDistance: 1),
            !decision.isExactJoin {
@@ -75,12 +76,16 @@ final class AtlasAutocorrectEngine {
         guard token.isEligible(in: leftContext) else { return nil }
 
         let normalized = token.normalized
+        // Romanized-Hindi (and other non-English) words the next-word model knows are
+        // intentional; never rewrite them to a nearby English word.
+        guard !lexicon.isProtected(normalized) else { return nil }
         let isDictionaryWord = lexicon.contains(normalized)
         let isPersonalKnownWord = sessionEngram.containsConfirmed(normalized) || globalEngram.containsConfirmed(normalized)
 
         var candidates = candidates(for: normalized, sessionEngram: sessionEngram, globalEngram: globalEngram)
         candidates.removeAll {
             feedback.shouldSuppressCorrection(typed: normalized, candidate: $0)
+                && !shouldOverrideSuppressionForStrongDirectTypo(typed: normalized, candidate: $0)
         }
         if isDictionaryWord {
             guard !isPersonalKnownWord else { return nil }
@@ -132,11 +137,25 @@ final class AtlasAutocorrectEngine {
                 let margin = bestProbability - secondProbability
                 let scoreGap = best.score - (ranked.dropFirst().first?.score ?? (best.score - 1.0))
                 let directTypo = best.distance == 1 && best.keyboardPenalty <= 0.35
+                let adjacentTransposition = isAdjacentTransposition(normalized, best.word)
                 let onlyStrongCandidate = ranked.count == 1 && best.score >= 2.45
                 let acceptedByProbability = ranked.count > 1
                     && bestProbability >= 0.55
                     && margin >= 0.20
-                let acceptedByScoreGap = best.score >= 2.7 && scoreGap >= 0.18 && (directTypo || best.distance == 1)
+                let acceptedByScoreGap = best.score >= 2.7
+                    && scoreGap >= 0.18
+                    && (directTypo || best.distance == 1 || adjacentTransposition)
+                let acceptedStrongDirectTypo = directTypo
+                    && !isDictionaryWord
+                    && lexicon.contains(best.word)
+                    && lexicon.frequency(for: best.word) >= 45_000
+                    && best.score >= 2.55
+                    && scoreGap >= 0.08
+                let acceptedStrongKnownTypo = isDictionaryWord
+                    && lexicon.contains(best.word)
+                    && lexicon.frequency(for: best.word) >= 90_000
+                    && best.score >= 3.0
+                    && (directTypo || adjacentTransposition)
 
                 splitDecision = splitCorrection(for: normalized)
                 if let splitDecision,
@@ -153,7 +172,11 @@ final class AtlasAutocorrectEngine {
                     )
                 }
 
-                if acceptedByProbability || acceptedByScoreGap || onlyStrongCandidate {
+                if acceptedByProbability
+                    || acceptedByScoreGap
+                    || onlyStrongCandidate
+                    || acceptedStrongDirectTypo
+                    || acceptedStrongKnownTypo {
                     return AtlasAutocorrectDecision(
                         original: typedWord,
                         replacement: token.preserveCase(applying: best.word),
@@ -197,16 +220,21 @@ final class AtlasAutocorrectEngine {
         let normalized = AtlasAutocorrectToken(rawValue: partialWord).normalized
         guard !normalized.isEmpty else { return [] }
 
-        let candidates = lexicon.completions(for: normalized, limit: AtlasConfiguration.maxSuggestions * 4)
-            + sessionEngram.completions(matching: normalized, limit: AtlasConfiguration.maxSuggestions)
-            + globalEngram.completions(matching: normalized, limit: AtlasConfiguration.maxSuggestions)
+        let lexiconCandidates = lexicon.completions(for: normalized, limit: AtlasConfiguration.maxSuggestions * 4)
+        let sessionCandidates = sessionEngram.completions(matching: normalized, limit: AtlasConfiguration.maxSuggestions)
+        let globalCandidates = globalEngram.completions(matching: normalized, limit: AtlasConfiguration.maxSuggestions)
+        let engramCandidates = Set(sessionCandidates + globalCandidates)
+        let candidates = lexiconCandidates + sessionCandidates + globalCandidates
 
         let ranked: [AtlasSuggestion] = candidates.map { candidate in
             let frequencyScore = min(0.35, log(lexicon.frequency(for: candidate)) * 0.03)
             let personalScore = sessionEngram.bias(for: candidate, context: leftContext)
             let globalScore = globalEngram.bias(for: candidate, context: leftContext) * 0.75
             let score = 0.4 + frequencyScore + personalScore + globalScore
-            return AtlasSuggestion(text: candidate, kind: .completion, score: score)
+            let isEngramCandidate = engramCandidates.contains(candidate)
+                || sessionEngram.containsConfirmed(candidate)
+                || globalEngram.containsConfirmed(candidate)
+            return AtlasSuggestion(text: candidate, kind: isEngramCandidate ? .personal : .completion, score: score)
         }
 
         let deduped = Dictionary(grouping: ranked, by: { $0.text.lowercased() })
@@ -247,17 +275,12 @@ final class AtlasAutocorrectEngine {
     }
 
     private func candidates(for word: String, sessionEngram: Engram, globalEngram: Engram) -> [String] {
-        var candidates = Set(lexicon.correctionCandidates(for: word, maxDistance: 1, limit: 10))
-        if candidates.isEmpty {
-            candidates.formUnion(lexicon.correctionCandidates(for: word, maxDistance: 2, limit: 10))
-        }
-        candidates.formUnion(sessionEngram.correctionCandidates(for: word, maxDistance: 2, limit: 10))
-        candidates.formUnion(globalEngram.correctionCandidates(for: word, maxDistance: 2, limit: 10))
+        var candidates = Set(lexicon.correctionCandidates(for: word, maxDistance: 1, limit: 16))
+        candidates.formUnion(lexicon.correctionCandidates(for: word, maxDistance: 2, limit: 24))
+        candidates.formUnion(sessionEngram.correctionCandidates(for: word, maxDistance: 2, limit: 12))
+        candidates.formUnion(globalEngram.correctionCandidates(for: word, maxDistance: 2, limit: 12))
 
-        let sameLengthCandidates = candidates.filter { $0.count == word.count }
-        let filteredCandidates = sameLengthCandidates.isEmpty ? candidates : sameLengthCandidates
-
-        return Array(filteredCandidates)
+        return Array(candidates)
             .filter { $0 != word && abs($0.count - word.count) <= 2 }
             .sorted { lhs, rhs in
                 let leftDistance = AtlasSpellingMetrics.editDistance(lhs, word)
@@ -265,23 +288,38 @@ final class AtlasAutocorrectEngine {
                 if leftDistance != rightDistance { return leftDistance < rightDistance }
                 return lexicon.frequency(for: lhs) > lexicon.frequency(for: rhs)
             }
-            .prefix(10)
+            .prefix(18)
             .map(\.self)
     }
 
     private func shouldCorrectKnownDictionaryWord(typed: String, candidate: String) -> Bool {
         guard lexicon.contains(candidate), typed.count == candidate.count else { return false }
-        guard AtlasSpellingMetrics.editDistance(typed, candidate, maxDistance: 1) == 1 else { return false }
-        guard keyboardDistancePenalty(typed: typed, candidate: candidate) <= 0.35 else { return false }
+        let isDirectTypo = AtlasSpellingMetrics.editDistance(typed, candidate, maxDistance: 1) == 1
+            && keyboardDistancePenalty(typed: typed, candidate: candidate) <= 0.35
+        let isTranspositionTypo = isAdjacentTransposition(typed, candidate)
+        guard isDirectTypo || isTranspositionTypo else { return false }
 
         let typedFrequency = lexicon.frequency(for: typed)
         let candidateFrequency = lexicon.frequency(for: candidate)
+        let adjacentTranspositionToVeryCommonWord = isTranspositionTypo
+            && candidateFrequency >= 90_000
+            && candidateFrequency >= typedFrequency * 1.15
         let adjacentTypoToVeryCommonWord = candidateFrequency >= 90_000
             && candidateFrequency >= typedFrequency * 1.25
         let strongFrequencyAdvantage = candidateFrequency >= typedFrequency * 3
             || candidateFrequency - typedFrequency >= 50_000
         let rareTypedWordToCommonCandidate = typedFrequency < 25_000 && candidateFrequency >= 45_000
-        return adjacentTypoToVeryCommonWord || strongFrequencyAdvantage || rareTypedWordToCommonCandidate
+        return adjacentTranspositionToVeryCommonWord
+            || adjacentTypoToVeryCommonWord
+            || strongFrequencyAdvantage
+            || rareTypedWordToCommonCandidate
+    }
+
+    private func shouldOverrideSuppressionForStrongDirectTypo(typed: String, candidate: String) -> Bool {
+        guard !lexicon.contains(typed), lexicon.contains(candidate) else { return false }
+        guard AtlasSpellingMetrics.editDistance(typed, candidate, maxDistance: 1) == 1 else { return false }
+        guard keyboardDistancePenalty(typed: typed, candidate: candidate) <= 0.35 else { return false }
+        return lexicon.frequency(for: candidate) >= 45_000
     }
 
     private func exactSplitCorrection(for word: String) -> SplitCorrectionCandidate? {
@@ -437,6 +475,11 @@ final class AtlasAutocorrectEngine {
         "it", "me", "my", "no", "of", "on", "or", "so", "to", "up", "us", "we"
     ]
 
+    /// How strongly typing-vs-candidate finger travel is weighted. A single key slip to
+    /// an adjacent key (e.g. "hwr" for "her") should clearly out-rank same-frequency
+    /// candidates that require a farther reach, so the raw keyboard penalty is amplified.
+    private static let keyboardPenaltyWeight = 2.5
+
     private func typoChannelScore(
         typed: String,
         candidate: String,
@@ -444,8 +487,13 @@ final class AtlasAutocorrectEngine {
         keyboardPenalty: Double
     ) -> Double {
         let prefixBoost = AtlasSpellingMetrics.commonPrefixLength(typed, candidate) >= 2 ? 0.25 : 0
-        let transpositionBoost = isAdjacentTransposition(typed, candidate) ? 2.8 : 0
-        return 3.2 - Double(distance) * 1.15 - keyboardPenalty + prefixBoost + transpositionBoost
+        let isTransposition = isAdjacentTransposition(typed, candidate)
+        let transpositionBoost = isTransposition ? 2.8 : 0
+        // Swapped-letter typos are scored by the transposition boost; their two differing
+        // characters are naturally far apart on the keyboard, so charging finger travel on
+        // top would wrongly penalise the correct word.
+        let effectiveKeyboardPenalty = isTransposition ? 0 : keyboardPenalty * Self.keyboardPenaltyWeight
+        return 3.2 - Double(distance) * 1.15 - effectiveKeyboardPenalty + prefixBoost + transpositionBoost
     }
 
     private func feedbackBoost(
@@ -629,6 +677,10 @@ private final class AtlasQuickSplitLexicon {
         compiled?.contains(word) == true
     }
 
+    func isProtected(_ word: String) -> Bool {
+        compiled?.isProtected(word) == true
+    }
+
     func hasDictionaryWordNear(_ word: String, maxDistance: Int) -> Bool {
         compiled?.correctionCandidates(
             forNormalizedWord: word,
@@ -718,7 +770,7 @@ final class LiveWordDecoder {
     }
 
     func snapshot() -> Snapshot? {
-        guard rawWord.count >= 3 else { return nil }
+        guard rawWord.count >= 2 else { return nil }
         return Snapshot(rawWord: rawWord, leftContext: leftContext, generation: generation)
     }
 
@@ -754,7 +806,7 @@ private struct AtlasAutocorrectToken {
 
     func isEligible(in leftContext: String) -> Bool {
         let word = normalized
-        guard word.count >= 3 else { return false }
+        guard word.count >= 2 else { return false }
         guard rawValue.rangeOfCharacter(from: .decimalDigits) == nil else { return false }
         guard !rawValue.contains("@"), !rawValue.contains(".") else { return false }
         guard word.rangeOfCharacter(from: .letters) != nil else { return false }
@@ -1064,6 +1116,15 @@ private final class AtlasAutocorrectLexicon {
         }
     }
 
+    func isProtected(_ word: String) -> Bool {
+        switch storage {
+        case .compiled(let compiled):
+            compiled.isProtected(word)
+        case .runtime:
+            false
+        }
+    }
+
     func frequency(for word: String) -> Double {
         switch storage {
         case .compiled(let compiled):
@@ -1157,7 +1218,7 @@ private final class AtlasAutocorrectLexicon {
     }
 
     nonisolated private static func isUsableCandidate(_ word: String) -> Bool {
-        word.count >= 3 && isUsableWord(word)
+        word.count >= 2 && isUsableWord(word)
     }
 
     private static func orderedUnique(_ words: [String]) -> [String] {

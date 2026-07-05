@@ -1,7 +1,7 @@
 import Foundation
 
 struct AutocorrectFeedbackSnapshot: Equatable {
-    private static let suppressionRejectionCount = 3
+    static let suppressionRejectionCount = 3
 
     var accepted: [String: [String: Int]] = [:]
     var rejected: [String: [String: Int]] = [:]
@@ -102,11 +102,23 @@ final class AutocorrectFeedbackStore {
         }
     }
 
-    func recordRejected(typed: String, correction: String, contextKey: String) {
+    func recordRejected(typed: String, correction: String, contextKey: String, weight: Int = 1) {
         update { state in
-            Self.increment(typed: typed, correction: correction, in: &state.rejected)
+            Self.increment(typed: typed, correction: correction, in: &state.rejected, by: max(1, weight))
             Self.prune(&state)
         }
+    }
+
+    /// Records a deliberate rejection (e.g. the user undid an autocorrection) with
+    /// enough weight to immediately suppress that correction, so the keyboard does
+    /// not keep re-correcting a word the user explicitly kept.
+    func recordExplicitRejection(typed: String, correction: String, contextKey: String) {
+        recordRejected(
+            typed: typed,
+            correction: correction,
+            contextKey: contextKey,
+            weight: AutocorrectFeedbackSnapshot.suppressionRejectionCount
+        )
     }
 
     func summaries(limit: Int = 50) -> [AutocorrectFeedbackSummary] {
@@ -191,11 +203,11 @@ final class AutocorrectFeedbackStore {
         }
     }
 
-    private static func increment(typed: String, correction: String, in table: inout [String: [String: FeedbackEntry]]) {
+    private static func increment(typed: String, correction: String, in table: inout [String: [String: FeedbackEntry]], by weight: Int = 1) {
         let now = Date()
         var candidates = table[typed] ?? [:]
         var entry = candidates[correction] ?? FeedbackEntry(count: 0, lastSeenAt: now)
-        entry.count += 1
+        entry.count += weight
         entry.lastSeenAt = now
         candidates[correction] = entry
         table[typed] = candidates

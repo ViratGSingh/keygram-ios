@@ -120,7 +120,8 @@ final class AtlasSuggestionRanker {
     ) -> AtlasSuggestion {
         let base = logits[word] ?? 0.12
         let engramBias = sessionEngram.bias(for: word, context: context) + globalEngram.bias(for: word, context: context) * 0.75
-        return AtlasSuggestion(text: word, kind: engramBias > 0.25 ? .personal : kind, score: base + engramBias)
+        let isEngramWord = sessionEngram.containsConfirmed(word) || globalEngram.containsConfirmed(word)
+        return AtlasSuggestion(text: word, kind: isEngramWord ? .personal : kind, score: base + engramBias)
     }
 
     private func isCorrectable(_ word: String) -> Bool {
@@ -177,7 +178,10 @@ final class AtlasSuggestionRanker {
 
     private func normalizedModelScore(for candidate: String, in logits: [String: Double]) -> Double {
         guard let rawScore = logits[candidate] else { return 0 }
-        guard let bestScore = logits.values.max(), bestScore > 0 else { return 0 }
+        guard let bestScore = logits.values.max() else { return 0 }
+        if bestScore <= 0 {
+            return exp(max(-8, rawScore - bestScore))
+        }
         return max(0, min(1, rawScore / bestScore))
     }
 
