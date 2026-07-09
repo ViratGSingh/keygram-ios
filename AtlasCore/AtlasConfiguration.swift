@@ -18,6 +18,7 @@ enum AtlasConfiguration {
     static let keyboardFullAccessGrantedKey = "atlas.keyboardFullAccessGranted"
     static let keyboardLastActiveAtKey = "atlas.keyboardLastActiveAt"
     static let onboardingCompletedKey = "atlas.onboardingCompleted"
+    static let fullAccessRequestedKey = "atlas.fullAccessRequested"
     static let engramLearningMigrationVersionKey = "atlas.engramLearningMigrationVersion"
     static let currentEngramLearningMigrationVersion = 6
     static let vocabularySize = 32_000

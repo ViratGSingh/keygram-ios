@@ -161,6 +161,24 @@ final class AutocorrectFeedbackStore {
         }
     }
 
+    /// Raw JSON snapshot of the persisted feedback state, for cloud backup.
+    /// Returned as opaque `Data` so the private `State` schema can evolve
+    /// independently of the backup bundle.
+    func exportData() -> Data? {
+        queue.sync {
+            try? JSONEncoder().encode(loadState())
+        }
+    }
+
+    /// Replaces the persisted feedback state from a backup snapshot produced by
+    /// `exportData()`. Malformed data is ignored so a bad restore can't wipe local data.
+    func importData(_ data: Data) {
+        queue.sync {
+            guard let state = try? JSONDecoder().decode(State.self, from: data) else { return }
+            saveState(state)
+        }
+    }
+
     func remove(typed: String, candidate: String) {
         queue.sync {
             var state = loadState()

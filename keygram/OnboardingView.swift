@@ -63,9 +63,9 @@ struct OnboardingView: View {
             if newValue.isComplete { celebrateAndFinish() }
         }
         .onReceive(pollTimer) { _ in
-            // While on the activation step the user is typing with Keygram inside the
-            // app, which is when the extension records Full Access. Poll to catch it.
-            if step == .activate { refresh() }
+            // On the activation step the user switches to Keygram inside the app, which is
+            // when the extension records Full Access. Poll both waiting steps to catch it.
+            if step == .activate || step == .allowFullAccess { refresh() }
         }
         .onAppear {
             refresh()
@@ -135,7 +135,7 @@ struct OnboardingView: View {
                 HintLabel(text: "Settings ▸ Keyboards ▸ Add New Keyboard ▸ Keygram")
             case .allowFullAccess:
                 PrimaryButton(title: "Allow Full Access", brand: Self.brand) {
-                    openKeyboardSettings()
+                    requestFullAccess()
                 }
                 HintLabel(text: "Settings ▸ Keygram ▸ turn on Allow Full Access")
             case .activate:
@@ -143,11 +143,25 @@ struct OnboardingView: View {
                     demoFieldFocused = true
                 }
                 HintLabel(text: "Tap the field, hold 🌐 and choose Keygram, then type a word")
+                Button("Full Access still off? Open Settings") {
+                    openKeyboardSettings()
+                }
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(.secondary)
             }
         }
     }
 
     // MARK: - Actions
+
+    /// Mark that the user has been sent to enable Full Access, then open Settings. Recording
+    /// this first lets onboarding advance to the activation step on return — Full Access can
+    /// only be *confirmed* once the keyboard is switched to, so we must not wait on it here.
+    private func requestFullAccess() {
+        KeyboardSetupStatus.fullAccessRequested = true
+        refresh()
+        openKeyboardSettings()
+    }
 
     private func openKeyboardSettings() {
         #if canImport(UIKit)

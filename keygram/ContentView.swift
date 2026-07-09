@@ -1,5 +1,7 @@
 import SwiftUI
 import Combine
+import StoreKit
+import SafariServices
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -40,7 +42,6 @@ struct ContentView: View {
     @State private var nextWordEvaluation = NextWordFeedbackStore.shared.evaluationSnapshot()
     @State private var learnedTypingTaps = Self.loadLearnedTypingTaps()
     @State private var typingModelHealth = Self.loadTypingModelHealth()
-    @State private var showingSignOutPlaceholder = false
     @State private var setupStatus = KeyboardSetupStatus.current()
     @State private var hasFinishedOnboarding = KeyboardSetupStatus.hasCompletedOnboarding
 
@@ -79,9 +80,6 @@ struct ContentView: View {
     private var homeContent: some View {
         NavigationStack {
             HomeView(
-                signOutAction: {
-                    showingSignOutPlaceholder = true
-                },
                 keyboardSettings: {
                     KeyboardSettingsView(
                         hapticsEnabled: $hapticsEnabled,
@@ -119,6 +117,9 @@ struct ContentView: View {
                         removeCorrection: removeCorrection,
                         resetCorrections: resetCorrections
                     )
+                },
+                backupAccount: {
+                    BackupAccountView()
                 }
             )
             .toolbar(.hidden, for: .navigationBar)
@@ -126,11 +127,6 @@ struct ContentView: View {
         // Bottom navigation is intentionally disabled. The home rows now own navigation.
         // TabView { Setup tab; Persona tab; Settings tab }
         .tint(.primary)
-        .alert("Sign out is not available yet", isPresented: $showingSignOutPlaceholder) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text("Sign in will be added later.")
-        }
         .onChange(of: sessions) { _, newValue in
             AtlasSessionStore.shared.saveSessions(newValue)
         }
@@ -249,12 +245,12 @@ private struct TypingModelHealth {
     }
 }
 
-private struct HomeView<KeyboardSettings: View, TypingPersonalization: View, PersonaWords: View, LearnedCorrections: View>: View {
-    var signOutAction: () -> Void
+private struct HomeView<KeyboardSettings: View, TypingPersonalization: View, PersonaWords: View, LearnedCorrections: View, BackupAccount: View>: View {
     @ViewBuilder var keyboardSettings: () -> KeyboardSettings
     @ViewBuilder var typingPersonalization: () -> TypingPersonalization
     @ViewBuilder var personaWords: () -> PersonaWords
     @ViewBuilder var learnedCorrections: () -> LearnedCorrections
+    @ViewBuilder var backupAccount: () -> BackupAccount
 
     var body: some View {
         GeometryReader { proxy in
@@ -292,38 +288,25 @@ private struct HomeView<KeyboardSettings: View, TypingPersonalization: View, Per
                     }
 
                     HomeSection {
-                        HomeNavigationRow("Rate Us", rowHeight: metrics.rowHeight) {
-                            PlaceholderPage(
-                                title: "Rate Us",
-                                systemImage: "star",
-                                message: "App Store rating will be connected before release."
-                            )
-                        }
+                        HomeRateRow(rowHeight: metrics.rowHeight)
                         HomeDivider()
-                        HomeNavigationRow("Privacy Policy", rowHeight: metrics.rowHeight) {
-                            PlaceholderPage(
-                                title: "Privacy Policy",
-                                systemImage: "hand.raised",
-                                message: "Privacy policy content will be added here."
-                            )
-                        }
+                        HomeLinkRow(
+                            "Privacy Policy",
+                            rowHeight: metrics.rowHeight,
+                            url: URL(string: "https://keygram.me/privacy")!
+                        )
                         HomeDivider()
-                        HomeNavigationRow("Terms of Service", rowHeight: metrics.rowHeight) {
-                            PlaceholderPage(
-                                title: "Terms of Service",
-                                systemImage: "doc.text",
-                                message: "Terms of service content will be added here."
-                            )
-                        }
+                        HomeLinkRow(
+                            "Terms of Service",
+                            rowHeight: metrics.rowHeight,
+                            url: URL(string: "https://keygram.me/terms")!
+                        )
                     }
 
                    HomeSection {
-                       HomeButtonRow(
-                           "Sign out",
-                           role: .destructive,
-                           rowHeight: metrics.rowHeight,
-                           action: signOutAction
-                       )
+                       HomeNavigationRow("Account", rowHeight: metrics.rowHeight) {
+                           backupAccount()
+                       }
                    }
                 }
             }
@@ -445,6 +428,45 @@ private struct HomeNavigationRow<Destination: View>: View {
     }
 }
 
+private struct HomeLinkRow: View {
+    var title: String
+    var rowHeight: CGFloat
+    var url: URL
+
+    init(_ title: String, rowHeight: CGFloat, url: URL) {
+        self.title = title
+        self.rowHeight = rowHeight
+        self.url = url
+    }
+
+    @State private var isPresentingWeb = false
+
+    var body: some View {
+        Button {
+            isPresentingWeb = true
+        } label: {
+            HomeRowLabel(title: title, role: nil, showsChevron: true, rowHeight: rowHeight)
+        }
+        .buttonStyle(.plain)
+        .sheet(isPresented: $isPresentingWeb) {
+            SafariView(url: url)
+                .ignoresSafeArea()
+        }
+    }
+}
+
+/// In-app browser (`SFSafariViewController`) so Privacy Policy / Terms open inside Keygram
+/// instead of switching the user out to the Safari app.
+private struct SafariView: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeUIViewController(context: Context) -> SFSafariViewController {
+        SFSafariViewController(url: url)
+    }
+
+    func updateUIViewController(_ controller: SFSafariViewController, context: Context) {}
+}
+
 private struct HomeButtonRow: View {
     var title: String
     var role: ButtonRole?
@@ -463,6 +485,43 @@ private struct HomeButtonRow: View {
             HomeRowLabel(title: title, role: role, showsChevron: false, rowHeight: rowHeight)
         }
         .buttonStyle(.plain)
+    }
+}
+
+/// "Rate Us" row. Deep-links straight to the App Store write-review sheet once the app is
+/// live (`AppStoreInfo.appStoreID` set); until then it falls back to StoreKit's in-app
+/// review prompt so the row is always functional.
+private struct HomeRateRow: View {
+    var rowHeight: CGFloat
+
+    @Environment(\.requestReview) private var requestReview
+    @Environment(\.openURL) private var openURL
+
+    var body: some View {
+        Button {
+            if let url = AppStoreInfo.writeReviewURL {
+                openURL(url)
+            } else {
+                requestReview()
+            }
+        } label: {
+            HomeRowLabel(title: "Rate Us", role: nil, showsChevron: true, rowHeight: rowHeight)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// App Store identifiers used for review/rating deep links.
+enum AppStoreInfo {
+    /// The numeric App Store ID (the `id######` in the product URL). Fill this in once the
+    /// app has been created in App Store Connect. While empty, "Rate Us" uses the in-app
+    /// StoreKit review prompt instead of the write-review deep link.
+    static let appStoreID = "6767987188"
+
+    /// Direct link to the App Store review composer, or `nil` if the ID isn't set yet.
+    static var writeReviewURL: URL? {
+        guard !appStoreID.isEmpty else { return nil }
+        return URL(string: "https://apps.apple.com/app/id\(appStoreID)?action=write-review")
     }
 }
 
@@ -524,7 +583,7 @@ private struct KeyboardSetupView: View {
             Section("Privacy") {
                 Label("No telemetry or analytics", systemImage: "eye.slash")
                 Label("Encrypted local persona", systemImage: "lock")
-                Label("Cloud sync is not enabled in this MVP", systemImage: "icloud.slash")
+                Label("Cloud backup is optional and only runs when you sign in", systemImage: "icloud")
             }
 
             #if canImport(UIKit)
@@ -1039,17 +1098,6 @@ private struct StickersView: View {
             }
         }
         .navigationTitle("Stickers")
-    }
-}
-
-private struct PlaceholderPage: View {
-    var title: String
-    var systemImage: String
-    var message: String
-
-    var body: some View {
-        ContentUnavailableView(title, systemImage: systemImage, description: Text(message))
-            .navigationTitle(title)
     }
 }
 

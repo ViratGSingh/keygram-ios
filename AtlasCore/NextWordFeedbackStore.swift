@@ -184,6 +184,24 @@ final class NextWordFeedbackStore {
         }
     }
 
+    /// Raw JSON snapshot of the persisted state (metrics + word/context stats),
+    /// for cloud backup. Opaque `Data` so the private `State` schema stays internal.
+    func exportData() -> Data? {
+        queue.sync {
+            try? JSONEncoder().encode(state())
+        }
+    }
+
+    /// Replaces the persisted state from a backup snapshot produced by `exportData()`.
+    /// Malformed data is ignored so a bad restore can't wipe local data.
+    func importData(_ data: Data) {
+        queue.sync {
+            guard let decoded = try? JSONDecoder().decode(State.self, from: data) else { return }
+            cachedState = decoded
+            saveState(decoded)
+        }
+    }
+
     func resetEvaluation() {
         queue.sync {
             var current = state()

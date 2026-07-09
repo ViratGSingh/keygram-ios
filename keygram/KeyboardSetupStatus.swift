@@ -13,6 +13,12 @@ import UIKit
 struct KeyboardSetupStatus: Equatable {
     var isKeyboardAdded: Bool
     var hasFullAccess: Bool
+    /// Whether the user has already been sent to Settings to grant Full Access. Full Access
+    /// itself can only be confirmed once the *extension* runs (it writes `hasFullAccess` from
+    /// the shared container, which it can only reach with access on), so we can't gate the
+    /// final "switch to Keygram" step on `hasFullAccess` — that would deadlock. This flag lets
+    /// onboarding advance to the activation step after the user visits Settings.
+    var didRequestFullAccess: Bool
 
     /// All onboarding requirements satisfied.
     var isComplete: Bool {
@@ -22,14 +28,15 @@ struct KeyboardSetupStatus: Equatable {
     /// The step the user currently needs to act on.
     var currentStep: OnboardingStep {
         if !isKeyboardAdded { return .addKeyboard }
-        if !hasFullAccess { return .allowFullAccess }
+        if !hasFullAccess && !didRequestFullAccess { return .allowFullAccess }
         return .activate
     }
 
     static func current() -> KeyboardSetupStatus {
         KeyboardSetupStatus(
             isKeyboardAdded: detectKeyboardAdded(),
-            hasFullAccess: detectFullAccess()
+            hasFullAccess: detectFullAccess(),
+            didRequestFullAccess: fullAccessRequested
         )
     }
 
@@ -48,6 +55,21 @@ struct KeyboardSetupStatus: Equatable {
             return false
         }
         return defaults.bool(forKey: AtlasConfiguration.keyboardFullAccessGrantedKey)
+    }
+
+    /// Persisted marker that the user has been sent to Settings to enable Full Access, so the
+    /// onboarding can advance to the "switch to Keygram" step where access is actually confirmed.
+    static var fullAccessRequested: Bool {
+        get {
+            guard let defaults = UserDefaults(suiteName: AtlasConfiguration.appGroupIdentifier) else {
+                return false
+            }
+            return defaults.bool(forKey: AtlasConfiguration.fullAccessRequestedKey)
+        }
+        set {
+            guard let defaults = UserDefaults(suiteName: AtlasConfiguration.appGroupIdentifier) else { return }
+            defaults.set(newValue, forKey: AtlasConfiguration.fullAccessRequestedKey)
+        }
     }
 
     /// Persisted marker so a user who finished setup is never sent back to onboarding

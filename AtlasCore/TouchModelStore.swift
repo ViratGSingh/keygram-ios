@@ -61,6 +61,25 @@ final class TouchModelStore {
         }
     }
 
+    /// Raw JSON bytes of the persisted touch model, for cloud backup.
+    /// Returns nil when no model has been saved yet.
+    func exportData() -> Data? {
+        queue.sync { [fileURL] in
+            guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
+            return try? Data(contentsOf: fileURL)
+        }
+    }
+
+    /// Restores the touch model from backup bytes produced by `exportData()`.
+    /// The bytes are validated by decoding a `TouchModel` before writing, so a
+    /// malformed payload is ignored rather than corrupting the on-device model.
+    func importData(_ data: Data) {
+        guard (try? JSONDecoder().decode(TouchModel.self, from: data)) != nil else { return }
+        queue.async { [fileURL] in
+            try? data.write(to: fileURL, options: [.atomic])
+        }
+    }
+
     /// For "reset personalization" in settings.
     func deleteSavedModel() {
         queue.async { [fileURL] in

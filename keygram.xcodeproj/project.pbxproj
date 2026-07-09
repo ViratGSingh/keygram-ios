@@ -14,6 +14,10 @@
 		C9A884522FA860000072C58D /* Configuration/LinkedAppIcons.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = C9A884532FA860000072C58D /* Configuration/LinkedAppIcons.xcassets */; };
 		C9A884542FA860000072C58D /* AtlasKeyboard/Assets.xcassets/AppIcon@3x.png in Resources */ = {isa = PBXBuildFile; fileRef = C9A884512FA860000072C58D /* AtlasKeyboard/Assets.xcassets/AppIcon@3x.png */; };
 		C9A884562FA870000072C58D /* keygram/Assets.xcassets/AppIcon.appiconset/AppIcon~ios-marketing.png in Resources */ = {isa = PBXBuildFile; fileRef = C9A884552FA870000072C58D /* keygram/Assets.xcassets/AppIcon.appiconset/AppIcon~ios-marketing.png */; };
+		C9D7EA442FFA322900C11F97 /* FirebaseAnalytics in Frameworks */ = {isa = PBXBuildFile; productRef = C9D7EA432FFA322900C11F97 /* FirebaseAnalytics */; };
+		C9D7EA462FFA322900C11F97 /* FirebaseAuth in Frameworks */ = {isa = PBXBuildFile; productRef = C9D7EA452FFA322900C11F97 /* FirebaseAuth */; };
+		C9D7EA482FFA322900C11F97 /* FirebaseFirestore in Frameworks */ = {isa = PBXBuildFile; productRef = C9D7EA472FFA322900C11F97 /* FirebaseFirestore */; };
+		C9D7EA4B2FFA3B0600C11F97 /* GoogleSignIn in Frameworks */ = {isa = PBXBuildFile; productRef = C9D7EA4A2FFA3B0600C11F97 /* GoogleSignIn */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -48,9 +52,22 @@
 		C9A884552FA870000072C58D /* keygram/Assets.xcassets/AppIcon.appiconset/AppIcon~ios-marketing.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "keygram/Assets.xcassets/AppIcon.appiconset/AppIcon~ios-marketing.png"; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		C9D7EA4D2FFA3B4C00C11F97 /* Exceptions for "keygram" folder in "keygram" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = C9A883CF2FA72F520072C58D /* keygram */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		C9A883D22FA72F520072C58D /* keygram */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				C9D7EA4D2FFA3B4C00C11F97 /* Exceptions for "keygram" folder in "keygram" target */,
+			);
 			path = keygram;
 			sourceTree = "<group>";
 		};
@@ -71,6 +88,10 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				C9D7EA442FFA322900C11F97 /* FirebaseAnalytics in Frameworks */,
+				C9D7EA4B2FFA3B0600C11F97 /* GoogleSignIn in Frameworks */,
+				C9D7EA462FFA322900C11F97 /* FirebaseAuth in Frameworks */,
+				C9D7EA482FFA322900C11F97 /* FirebaseFirestore in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -131,6 +152,10 @@
 			);
 			name = keygram;
 			packageProductDependencies = (
+				C9D7EA432FFA322900C11F97 /* FirebaseAnalytics */,
+				C9D7EA452FFA322900C11F97 /* FirebaseAuth */,
+				C9D7EA472FFA322900C11F97 /* FirebaseFirestore */,
+				C9D7EA4A2FFA3B0600C11F97 /* GoogleSignIn */,
 			);
 			productName = keygram;
 			productReference = C9A883D02FA72F520072C58D /* keygram.app */;
@@ -191,6 +216,8 @@
 			packageReferences = (
 				C9A884322FA850000072C58D /* XCRemoteSwiftPackageReference "onnxruntime-swift-package-manager" */,
 				C9A884422FA850000072C58D /* XCRemoteSwiftPackageReference "swift-sentencepiece" */,
+				C9D7EA422FFA322900C11F97 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */,
+				C9D7EA492FFA3B0600C11F97 /* XCRemoteSwiftPackageReference "GoogleSignIn-iOS" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = C9A883D12FA72F520072C58D /* Products */;
@@ -378,10 +405,11 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = Configuration/keygram.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 4;
+				CURRENT_PROJECT_VERSION = 7;
 				DEVELOPMENT_TEAM = R9S2LGQV22;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = keygram/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = Keygram;
 				INFOPLIST_KEY_CFBundleIconName = MobileAppIcon;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -397,12 +425,14 @@
 				PRODUCT_BUNDLE_IDENTIFIER = com.wooshir.keygram;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2";
+				TARGETED_DEVICE_FAMILY = 1;
 			};
 			name = Debug;
 		};
@@ -413,10 +443,11 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = Configuration/keygram.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 4;
+				CURRENT_PROJECT_VERSION = 7;
 				DEVELOPMENT_TEAM = R9S2LGQV22;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = keygram/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = Keygram;
 				INFOPLIST_KEY_CFBundleIconName = MobileAppIcon;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -432,12 +463,14 @@
 				PRODUCT_BUNDLE_IDENTIFIER = com.wooshir.keygram;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2";
+				TARGETED_DEVICE_FAMILY = 1;
 			};
 			name = Release;
 		};
@@ -466,7 +499,7 @@
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2";
+				TARGETED_DEVICE_FAMILY = 1;
 			};
 			name = Debug;
 		};
@@ -495,7 +528,7 @@
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2";
+				TARGETED_DEVICE_FAMILY = 1;
 			};
 			name = Release;
 		};
@@ -548,6 +581,22 @@
 				minimumVersion = 0.0.6;
 			};
 		};
+		C9D7EA422FFA322900C11F97 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/firebase/firebase-ios-sdk";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 12.15.0;
+			};
+		};
+		C9D7EA492FFA3B0600C11F97 /* XCRemoteSwiftPackageReference "GoogleSignIn-iOS" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/google/GoogleSignIn-iOS";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 9.2.0;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -560,6 +609,26 @@
 			isa = XCSwiftPackageProductDependency;
 			package = C9A884422FA850000072C58D /* XCRemoteSwiftPackageReference "swift-sentencepiece" */;
 			productName = SentencepieceTokenizer;
+		};
+		C9D7EA432FFA322900C11F97 /* FirebaseAnalytics */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = C9D7EA422FFA322900C11F97 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */;
+			productName = FirebaseAnalytics;
+		};
+		C9D7EA452FFA322900C11F97 /* FirebaseAuth */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = C9D7EA422FFA322900C11F97 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */;
+			productName = FirebaseAuth;
+		};
+		C9D7EA472FFA322900C11F97 /* FirebaseFirestore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = C9D7EA422FFA322900C11F97 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */;
+			productName = FirebaseFirestore;
+		};
+		C9D7EA4A2FFA3B0600C11F97 /* GoogleSignIn */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = C9D7EA492FFA3B0600C11F97 /* XCRemoteSwiftPackageReference "GoogleSignIn-iOS" */;
+			productName = GoogleSignIn;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
