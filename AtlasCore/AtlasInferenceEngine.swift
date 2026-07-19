@@ -885,6 +885,11 @@ final class AtlasInferenceEngine {
         let normalized = EngramNormalizer.normalize(selectedWord)
         guard normalized.count >= 3 else { return [] }
 
+        // Bound the probe context so autocorrect replay length stays constant as the
+        // paragraph grows. Replaying the full document context here is what pushes the
+        // keyboard extension past its memory/latency budget on long inputs.
+        let leftContext = boundedTailContext(leftContext, maxWords: AtlasConfiguration.autocorrectContextWordLimit)
+
         let baseGLAState = state.glaState
         let prefixLength = min(2, normalized.count)
         let prefixProbeContext = leftContext + String(normalized.prefix(prefixLength))
@@ -939,6 +944,25 @@ final class AtlasInferenceEngine {
                 logits[tokenID] += boost
             }
         }
+    }
+
+    /// Returns the trailing `maxWords` words of `context`, preserving any trailing
+    /// whitespace. Used to cap how much history the model replays for autocorrect.
+    private func boundedTailContext(_ context: String, maxWords: Int) -> String {
+        guard maxWords > 0 else { return context }
+
+        var wordRanges: [Range<String.Index>] = []
+        context.enumerateSubstrings(in: context.startIndex..<context.endIndex, options: [.byWords]) { _, range, _, _ in
+            wordRanges.append(range)
+        }
+
+        guard wordRanges.count > maxWords,
+              let start = wordRanges.suffix(maxWords).first?.lowerBound
+        else {
+            return context
+        }
+
+        return String(context[start...])
     }
 
     private func scoresByReplaying(

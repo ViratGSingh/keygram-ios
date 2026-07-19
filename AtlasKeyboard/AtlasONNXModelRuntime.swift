@@ -14,8 +14,8 @@ final class AtlasONNXModelRuntime: AtlasModelRuntime {
 
     private enum OutputName {
         static let logits = "logits"
-        static func keyCache(_ index: Int) -> String { "new_k\(index)_cache" }
-        static func valueCache(_ index: Int) -> String { "new_v\(index)_cache" }
+        static func keyCache(_ index: Int) -> String { "k\(index)_cache_out" }
+        static func valueCache(_ index: Int) -> String { "v\(index)_cache_out" }
         static func glaState(_ index: Int) -> String { "new_gla_state_\(index)" }
     }
 

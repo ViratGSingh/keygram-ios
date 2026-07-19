@@ -13,9 +13,17 @@ final class AtlasSentencePieceTokenizer: AtlasTokenizing {
     }
 
     func encodeLatestTokens(from context: String) -> [Int64] {
+        // The general model requires lowercased input and a leading BOS token at
+        // the start of every sequence (see the integration contract). We stream
+        // tokens into the stateful model, so BOS is only emitted when we begin a
+        // fresh sequence (i.e. when there is no prior context to continue from).
+        let context = context.lowercased()
         defer { lastContext = context }
-        guard context.hasPrefix(lastContext) else {
-            return (try? tokenizer.encode(context).map(Int64.init)) ?? []
+
+        guard !lastContext.isEmpty, context.hasPrefix(lastContext) else {
+            let bos = Int64(tokenizer.bosTokenId)
+            let encoded = (try? tokenizer.encode(context).map(Int64.init)) ?? []
+            return [bos] + encoded
         }
 
         let delta = String(context.dropFirst(lastContext.count))

@@ -2,6 +2,9 @@ import UIKit
 
 protocol KeyboardSurfaceViewDelegate: AnyObject {
     func keyboardSurfaceView(_ view: KeyboardSurfaceView, didTap key: KeyboardKey, at point: CGPoint, touchStartedAt: CFTimeInterval, touchEndedAt: CFTimeInterval)
+    /// The user is gliding on the spacebar to reposition the caret. `offset` is the
+    /// signed number of characters to move the caret by (negative = left).
+    func keyboardSurfaceView(_ view: KeyboardSurfaceView, didGlideCursorBy offset: Int)
     func keyboardSurfaceView(_ view: KeyboardSurfaceView, didAccept suggestion: AtlasSuggestion, touchStartedAt: CFTimeInterval, touchEndedAt: CFTimeInterval)
     func keyboardSurfaceView(_ view: KeyboardSurfaceView, preferredHeightDidChange height: CGFloat)
     func keyboardSurfaceViewDidLongPressBackspace(_ view: KeyboardSurfaceView)
@@ -160,7 +163,18 @@ final class KeyboardSurfaceView: UIView {
     private var visibleEmojiGridStyle: EmojiGridStyle = .unicodeEmoji
     private var lastReportedPreferredHeight = LayoutMetric.keyboardContentHeight
     private let keyFeedback = UIImpactFeedbackGenerator(style: .light)
+    private let glideFeedback = UISelectionFeedbackGenerator()
     private var hapticsEnabled = true
+
+    /// Horizontal drag distance (points) that moves the caret by one character while
+    /// gliding on the spacebar.
+    private static let spaceGlideStep: CGFloat = 9
+    /// Caret offset already applied during the current spacebar glide, relative to the
+    /// caret position at glide start.
+    private var spaceGlideAppliedOffset = 0
+    /// True once the current spacebar touch has moved far enough to count as a glide
+    /// (so the release should not insert a space).
+    private(set) var spaceGlideDidMove = false
 
     private enum KeyboardMode {
         case letters
@@ -2093,6 +2107,11 @@ final class KeyboardSurfaceView: UIView {
         if case .character = key {
             button.addTarget(self, action: #selector(characterKeyTouchEnded(_:)), for: [.touchUpInside, .touchUpOutside, .touchCancel, .touchDragExit])
         }
+        if key == .space {
+            let glide = UIPanGestureRecognizer(target: self, action: #selector(spaceGlidePanned(_:)))
+            glide.maximumNumberOfTouches = 1
+            button.addGestureRecognizer(glide)
+        }
         if let width {
             button.widthAnchor.constraint(equalToConstant: width).isActive = true
         }
@@ -2283,6 +2302,35 @@ final class KeyboardSurfaceView: UIView {
 
     @objc private func keyTouchCancelled(_ sender: KeyboardButton) {
         controlTouchCancelled(sender)
+    }
+
+    /// Handles gliding on the spacebar to move the text caret. While the finger drags,
+    /// horizontal movement is translated into caret offsets; the gesture recognizer
+    /// cancels the button's touch tracking once it engages, so no space is inserted.
+    @objc private func spaceGlidePanned(_ recognizer: UIPanGestureRecognizer) {
+        switch recognizer.state {
+        case .began:
+            spaceGlideAppliedOffset = 0
+            spaceGlideDidMove = false
+            glideFeedback.prepare()
+        case .changed:
+            let translationX = recognizer.translation(in: self).x
+            let targetOffset = Int((translationX / Self.spaceGlideStep).rounded(.towardZero))
+            let delta = targetOffset - spaceGlideAppliedOffset
+            guard delta != 0 else { return }
+            spaceGlideAppliedOffset = targetOffset
+            spaceGlideDidMove = true
+            delegate?.keyboardSurfaceView(self, didGlideCursorBy: delta)
+            if hapticsEnabled {
+                glideFeedback.selectionChanged()
+                glideFeedback.prepare()
+            }
+        case .ended, .cancelled, .failed:
+            spaceGlideAppliedOffset = 0
+            spaceGlideDidMove = false
+        default:
+            break
+        }
     }
 
     @objc private func keyTapped(_ sender: KeyboardButton) {

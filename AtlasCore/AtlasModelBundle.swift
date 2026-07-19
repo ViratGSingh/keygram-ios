@@ -7,6 +7,7 @@ struct AtlasModelBundle {
     static func resolve(in bundle: Bundle = .main) throws -> AtlasModelBundle {
         let modelURL = try resolveResource(
             candidates: [
+                "atlas_general_keyboard_q8",
                 "atlas_v3_keyboard_q8",
                 "altaas_v3_lkeybaord_q8",
                 "atlas_v2_keyboard_q8",
@@ -16,7 +17,7 @@ struct AtlasModelBundle {
             in: bundle
         )
         let tokenizerURL = try resolveResource(
-            candidates: ["v3_spm", "v2_spm"],
+            candidates: ["general_spm", "v3_spm", "v2_spm"],
             extension: "model",
             in: bundle
         )

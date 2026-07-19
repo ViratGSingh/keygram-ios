@@ -52,7 +52,22 @@ final class AtlasAutocorrectEngine {
         guard quickLexicon.isAvailable else { return nil }
         guard !quickLexicon.isDictionaryWord(normalized) else { return nil }
         guard !quickLexicon.isProtected(normalized) else { return nil }
-        guard let decision = quickSplitCorrection(for: normalized, lexicon: quickLexicon) else { return nil }
+        guard let decision = quickSplitCorrection(for: normalized, lexicon: quickLexicon) else {
+            // No clean 2-way split: try to recover a run-on of several words typed with
+            // a few stray letters between them (e.g. "knowpvlking" -> "know king").
+            if let segmentation = junkTolerantSegmentation(
+                of: normalized,
+                isSegmentWord: quickLexicon.isSegmentWord
+            ) {
+                return AtlasAutocorrectDecision(
+                    original: typedWord,
+                    replacement: token.preserveCase(applying: segmentation.replacement),
+                    confidence: segmentation.confidence,
+                    margin: segmentation.margin
+                )
+            }
+            return nil
+        }
         if quickLexicon.hasDictionaryWordNear(normalized, maxDistance: 1),
            !decision.isExactJoin {
             return nil
@@ -200,6 +215,23 @@ final class AtlasAutocorrectEngine {
                 replacement: token.preserveCase(applying: splitDecision.replacement),
                 confidence: splitDecision.confidence,
                 margin: splitDecision.margin
+            )
+        }
+
+        // Last resort: recover a run-on of several words typed with a few stray
+        // letters between them (e.g. "knowpvlking" -> "know king"). Only attempt this
+        // for unknown tokens the clean split logic above could not resolve.
+        if !isDictionaryWord, !isPersonalKnownWord,
+           let segmentation = junkTolerantSplitCorrection(for: normalized),
+           !feedback.shouldSuppressCorrection(
+               typed: normalized,
+               candidate: segmentation.replacement
+           ) {
+            return AtlasAutocorrectDecision(
+                original: typedWord,
+                replacement: token.preserveCase(applying: segmentation.replacement),
+                confidence: segmentation.confidence,
+                margin: segmentation.margin
             )
         }
 
@@ -470,6 +502,138 @@ final class AtlasAutocorrectEngine {
         return lexicon.contains(word) && lexicon.frequency(for: word) >= 16_000
     }
 
+    /// Only recover words that rank inside the most-frequent `segmentWordRankLimit`
+    /// entries. Ranking is robust to the noisy/contaminated word list: real words like
+    /// "king" rank near the top, while junk 3-letter tokens (e.g. "kno", "wty") fall
+    /// into the long tail and are rejected, so they can never be tiled into a bogus
+    /// full-coverage split.
+    static let segmentWordRankLimit = 12_000
+
+    /// A single dictionary word we are willing to recover while segmenting a run-on
+    /// token. One-letter words ("a"/"i") are only accepted at the very start of the
+    /// token, so they are never inserted between other words. Short 3-4 letter words
+    /// must rank as common (junk fragments like "kno" are usually this length); 5+
+    /// letter exact dictionary words are trusted even if uncommon (e.g. "breaker"),
+    /// since fat-fingered junk almost never spells a long real word.
+    private func isSegmentWord(_ word: String, atStart: Bool) -> Bool {
+        switch word.count {
+        case 1:
+            return atStart && (word == "a" || word == "i")
+        case 2:
+            return Self.strongTwoLetterSplitWords.contains(word) && lexicon.contains(word)
+        case 3, 4:
+            return lexicon.isCommonRankedWord(word, withinRank: Self.segmentWordRankLimit)
+        default:
+            return lexicon.contains(word)
+        }
+    }
+
+    private func junkTolerantSplitCorrection(for word: String) -> JunkTolerantSegmentation? {
+        Self.junkTolerantSegmentation(of: word, isSegmentWord: isSegmentWord)
+    }
+
+    struct JunkTolerantSegmentation {
+        var replacement: String
+        var confidence: Double
+        var margin: Double
+    }
+
+    /// Segments a run-on token (e.g. "knowpvlking") into the sequence of dictionary
+    /// words it contains ("know king"), tolerating a small number of stray letters the
+    /// user fat-fingered between words during fast typing.
+    ///
+    /// The scoring minimises `dropped-letters + wordCostWeight * word-count`. Because
+    /// every character is either inside a word or dropped, simply maximising coverage
+    /// would always insert extra short words to avoid dropping a stray letter (turning
+    /// "knowaking" into "know a king"). Charging a per-word cost makes the segmenter
+    /// prefer dropping one stray letter over inserting a spurious word, while still
+    /// splitting into genuine words. Deliberately conservative: fires only as a last
+    /// resort, requires at least two words and one word of length >= 3, and caps the
+    /// junk it will silently discard.
+    static func junkTolerantSegmentation(
+        of word: String,
+        isSegmentWord: (_ word: String, _ atStart: Bool) -> Bool
+    ) -> JunkTolerantSegmentation? {
+        guard word.count >= 6, word.count <= 24 else { return nil }
+        let chars = Array(word)
+        let count = chars.count
+        let maxWordLength = 12
+        // Each spurious word must save more than this many dropped letters to be worth
+        // inserting; > 1 stops a single dropped letter being replaced by an inserted
+        // word, < 2 still lets a real two-letter word cover two characters.
+        let wordCostWeight = 1.5
+
+        struct Path {
+            var cost: Double
+            var coverage: Int
+            var junk: Int
+            var wordCount: Int
+            var hasLongWord: Bool
+            var words: [String]
+        }
+
+        func isBetter(_ lhs: Path, than rhs: Path) -> Bool {
+            if lhs.cost != rhs.cost { return lhs.cost < rhs.cost }
+            if lhs.wordCount != rhs.wordCount { return lhs.wordCount < rhs.wordCount }
+            return lhs.junk < rhs.junk
+        }
+
+        var dp: [Path?] = Array(repeating: nil, count: count + 1)
+        dp[0] = Path(cost: 0, coverage: 0, junk: 0, wordCount: 0, hasLongWord: false, words: [])
+
+        for index in 0..<count {
+            guard let current = dp[index] else { continue }
+
+            // Option 1: treat chars[index] as a stray letter and drop it.
+            let dropped = Path(
+                cost: current.cost + 1,
+                coverage: current.coverage,
+                junk: current.junk + 1,
+                wordCount: current.wordCount,
+                hasLongWord: current.hasLongWord,
+                words: current.words
+            )
+            if dp[index + 1] == nil || isBetter(dropped, than: dp[index + 1]!) {
+                dp[index + 1] = dropped
+            }
+
+            // Option 2: match a real word starting at chars[index].
+            let maxLength = min(maxWordLength, count - index)
+            guard maxLength >= 1 else { continue }
+            for length in 1...maxLength {
+                let candidate = String(chars[index..<(index + length)])
+                guard isSegmentWord(candidate, index == 0) else { continue }
+                let target = index + length
+                let matched = Path(
+                    cost: current.cost + wordCostWeight,
+                    coverage: current.coverage + length,
+                    junk: current.junk,
+                    wordCount: current.wordCount + 1,
+                    hasLongWord: current.hasLongWord || length >= 3,
+                    words: current.words + [candidate]
+                )
+                if dp[target] == nil || isBetter(matched, than: dp[target]!) {
+                    dp[target] = matched
+                }
+            }
+        }
+
+        guard let best = dp[count] else { return nil }
+        guard best.wordCount >= 2, best.hasLongWord else { return nil }
+        guard best.junk <= 3, best.junk < best.coverage else { return nil }
+        // Require the recovered words to cover at least 60% of the typed characters.
+        guard best.coverage * 5 >= count * 3 else { return nil }
+
+        let coverageRatio = Double(best.coverage) / Double(count)
+        let confidence = min(0.92, max(0.74, 0.68 + coverageRatio * 0.2 - Double(best.junk) * 0.05))
+        let margin = max(0.10, min(0.40, coverageRatio * 0.25 - Double(best.junk) * 0.04))
+        return JunkTolerantSegmentation(
+            replacement: best.words.joined(separator: " "),
+            confidence: confidence,
+            margin: margin
+        )
+    }
+
     private static let strongTwoLetterSplitWords: Set<String> = [
         "am", "an", "as", "at", "be", "by", "do", "go", "he", "if", "in", "is",
         "it", "me", "my", "no", "of", "on", "or", "so", "to", "up", "us", "we"
@@ -718,6 +882,28 @@ private final class AtlasQuickSplitLexicon {
 
     func frequency(for word: String) -> Double {
         compiled?.frequency(for: word) ?? 1
+    }
+
+    /// A single dictionary word we are willing to recover while segmenting a run-on
+    /// token, mirroring `AtlasAutocorrectEngine.isSegmentWord` for the quick path.
+    /// One-letter words ("a"/"i") are only accepted at the very start of the token so
+    /// they are never inserted between other words.
+    func isSegmentWord(_ word: String, atStart: Bool) -> Bool {
+        switch word.count {
+        case 1:
+            return atStart && (word == "a" || word == "i")
+        case 2:
+            return isStrongSplitWord(word)
+        case 3, 4:
+            guard let compiled, compiled.contains(word),
+                  let rank = compiled.candidateRank(for: word)
+            else {
+                return false
+            }
+            return rank <= AtlasAutocorrectEngine.segmentWordRankLimit
+        default:
+            return isDictionaryWord(word)
+        }
     }
 }
 
@@ -1131,6 +1317,21 @@ private final class AtlasAutocorrectLexicon {
             compiled.frequency(for: word)
         case .runtime(let runtime):
             max(1, runtime.frequencies[word] ?? 8)
+        }
+    }
+
+    /// Whether `word` is among the `limit` most frequent known words. Rank is
+    /// scale-invariant and robust to a noisy/contaminated frequency table: genuine
+    /// common English words rank near the top, while junk and romanized-Hindi tokens
+    /// fall into the long tail. The runtime fallback has no rank, so it approximates
+    /// with a frequency floor.
+    func isCommonRankedWord(_ word: String, withinRank limit: Int) -> Bool {
+        switch storage {
+        case .compiled(let compiled):
+            guard let rank = compiled.candidateRank(for: word) else { return false }
+            return rank <= limit
+        case .runtime(let runtime):
+            return runtime.wordSet.contains(word) && (runtime.frequencies[word] ?? 0) >= 8_000
         }
     }
 

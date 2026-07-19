@@ -21,13 +21,18 @@ enum AtlasConfiguration {
     static let fullAccessRequestedKey = "atlas.fullAccessRequested"
     static let engramLearningMigrationVersionKey = "atlas.engramLearningMigrationVersion"
     static let currentEngramLearningMigrationVersion = 6
-    static let vocabularySize = 32_000
+    static let vocabularySize = 24_000
     static let attentionLayerCount = 4
     static let glaLayerCount = 4
-    static let maxContextTokens = 512
+    static let maxContextTokens = 128
     nonisolated static let maxSuggestions = 3
     nonisolated static let suggestionVocabularyLimit = 15_000
     nonisolated static let nextWordContextWordLimit = 20
+    // Autocorrect replays its probe context through the model twice per completed
+    // word. Only a few words of local left-context matter for rescoring a typo, so
+    // this is capped tightly to keep replay length (and the keyboard extension's
+    // memory/latency budget) bounded regardless of paragraph length.
+    nonisolated static let autocorrectContextWordLimit = 12
     nonisolated static let personalNGramCandidateLimit = 100
     nonisolated static let neuralNextWordCandidateLimit = 64
     nonisolated static let neuralWordBeamWidth = 6

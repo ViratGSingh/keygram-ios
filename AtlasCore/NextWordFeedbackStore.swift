@@ -86,6 +86,12 @@ final class NextWordFeedbackStore {
     private let fileName = "atlas-next-word-feedback-v1.json"
     private let queue = DispatchQueue(label: "com.wooshir.keygram.next-word-feedback", qos: .utility)
     private var cachedState: State?
+    /// Modification date of `fileURL` as of our last load/save. The metrics file is
+    /// shared between the app and the keyboard extension (two processes), so this
+    /// lets each side notice writes made by the other and drop its stale cache
+    /// before reading or merging — e.g. so a reset in the app isn't resurrected by
+    /// the extension writing its old cached counts back.
+    private var lastKnownModificationDate: Date?
 
     private var baseURL: URL {
         FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: AtlasConfiguration.appGroupIdentifier)
@@ -105,6 +111,17 @@ final class NextWordFeedbackStore {
 
     func evaluationSnapshot() -> NextWordEvaluationSnapshot {
         queue.sync { state().evaluation }
+    }
+
+    /// Drops the in-memory cache and re-reads the shared app-group file. The
+    /// evaluation metrics are written by the keyboard extension (a separate
+    /// process), so the containing app must reload from disk to observe updates —
+    /// otherwise it keeps serving the frozen snapshot it first loaded. Call this
+    /// before reading a fresh `evaluationSnapshot()` for display.
+    func reloadFromDisk() {
+        queue.sync {
+            cachedState = loadState()
+        }
     }
 
     func recordInference(milliseconds: Double) {
@@ -239,7 +256,7 @@ final class NextWordFeedbackStore {
     }
 
     private func state() -> State {
-        if let cachedState {
+        if let cachedState, !fileChangedExternally() {
             return cachedState
         }
         let loaded = loadState()
@@ -247,23 +264,46 @@ final class NextWordFeedbackStore {
         return loaded
     }
 
+    /// True when the shared file has been modified since we last loaded/saved it,
+    /// i.e. the other process wrote to it. A cheap `stat`; the expensive decode in
+    /// `loadState()` only runs when this actually reports a change.
+    private func fileChangedExternally() -> Bool {
+        guard let current = fileModificationDate() else { return false }
+        guard let last = lastKnownModificationDate else { return true }
+        return current > last
+    }
+
+    private func fileModificationDate() -> Date? {
+        (try? fileURL.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+    }
+
     private func loadState() -> State {
-        guard let data = try? Data(contentsOf: fileURL),
-              let decoded = try? JSONDecoder().decode(State.self, from: data)
-        else {
-            return State()
+        var loaded = State()
+        var coordinationError: NSError?
+        NSFileCoordinator().coordinate(readingItemAt: fileURL, options: [], error: &coordinationError) { url in
+            guard let data = try? Data(contentsOf: url),
+                  let decoded = try? JSONDecoder().decode(State.self, from: data)
+            else {
+                return
+            }
+            loaded = decoded
         }
-        return decoded
+        lastKnownModificationDate = fileModificationDate()
+        return loaded
     }
 
     private func saveState(_ state: State) {
-        do {
-            try FileManager.default.createDirectory(at: baseURL, withIntermediateDirectories: true)
-            let data = try JSONEncoder().encode(state)
-            try data.write(to: fileURL, options: [.atomic])
-        } catch {
-            NSLog("Keygram: failed to save next-word feedback: \(error)")
+        var coordinationError: NSError?
+        NSFileCoordinator().coordinate(writingItemAt: fileURL, options: [], error: &coordinationError) { url in
+            do {
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                let data = try JSONEncoder().encode(state)
+                try data.write(to: url, options: [.atomic])
+            } catch {
+                NSLog("Keygram: failed to save next-word feedback: \(error)")
+            }
         }
+        lastKnownModificationDate = fileModificationDate()
     }
 
     private static func normalizedFirstWords(_ predictions: [String]) -> [String] {

@@ -1381,10 +1381,11 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     private func applySuggestions(
-        _ suggestions: [AtlasSuggestion],
+        _ rawSuggestions: [AtlasSuggestion],
         evaluationContext: String? = nil,
         inferenceMilliseconds: Double? = nil
     ) {
+        let suggestions = applyingSuggestionCasing(to: rawSuggestions)
         if let inferenceMilliseconds {
             NextWordFeedbackStore.shared.recordInference(milliseconds: inferenceMilliseconds)
         }
@@ -1412,6 +1413,62 @@ final class KeyboardViewController: UIInputViewController {
             return
         }
         keyboardView?.setSuggestions(suggestions)
+    }
+
+    /// Suggestions come out of the lexicon/vocabulary lowercased. This restores the casing the
+    /// user is actually typing: while completing a word we mirror the partial's case; for
+    /// next-word predictions we capitalize only at a sentence start (first word, or right after
+    /// `.`, `!`, or `?`). Corrections already carry their own preserved case, so re-applying is
+    /// idempotent here.
+    private func applyingSuggestionCasing(to suggestions: [AtlasSuggestion]) -> [AtlasSuggestion] {
+        guard !suggestions.isEmpty else { return suggestions }
+        let context = contextBeforeInput()
+        let partial = PartialWordDetector.partialWord(in: context)
+        let capitalizeNextWord = (partial?.isEmpty ?? true) && isSentenceStart(context)
+        guard (partial?.isEmpty == false) || capitalizeNextWord else { return suggestions }
+
+        return suggestions.map { suggestion in
+            switch suggestion.kind {
+            case .enableFullAccess, .undoAutocorrection:
+                return suggestion
+            case .nextWord, .completion, .correction, .personal:
+                break
+            }
+            let cased: String
+            if let partial, !partial.isEmpty {
+                cased = Self.matchingCase(of: partial, appliedTo: suggestion.text)
+            } else if capitalizeNextWord {
+                cased = Self.capitalizingFirstLetter(suggestion.text)
+            } else {
+                cased = suggestion.text
+            }
+            guard cased != suggestion.text else { return suggestion }
+            return AtlasSuggestion(text: cased, kind: suggestion.kind, score: suggestion.score)
+        }
+    }
+
+    /// True when the next word would begin a sentence: nothing typed yet, or the last
+    /// non-whitespace character ends a sentence (`.`, `!`, `?`).
+    private func isSentenceStart(_ context: String) -> Bool {
+        let trimmed = context.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let last = trimmed.last else { return true }
+        return ".!?".contains(last)
+    }
+
+    private static func matchingCase(of original: String, appliedTo candidate: String) -> String {
+        guard original != original.lowercased() else { return candidate }
+        if original == original.uppercased() {
+            return candidate.uppercased()
+        }
+        if let first = original.first, String(first) == String(first).uppercased() {
+            return capitalizingFirstLetter(candidate)
+        }
+        return candidate
+    }
+
+    private static func capitalizingFirstLetter(_ text: String) -> String {
+        guard let first = text.first else { return text }
+        return String(first).uppercased() + text.dropFirst()
     }
 
     private func acceptSuggestion(_ suggestion: AtlasSuggestion, touchStartedAt: CFTimeInterval, touchEndedAt: CFTimeInterval) {
@@ -1469,7 +1526,13 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     private func shouldReplacePartial(_ partial: String, with suggestion: String, suggestionKind: AtlasSuggestionKind) -> Bool {
-        suggestionKind == .completion || suggestion.localizedCaseInsensitiveCompare(partial) == .orderedSame || suggestion.lowercased().hasPrefix(partial.lowercased())
+        // Completions and corrections both replace the word currently being typed. Without this,
+        // a correction that isn't a prefix of the typed text (e.g. "exapmples" -> "examples") would
+        // fall through and get appended, clubbing the two words together ("exapmplesexamples").
+        suggestionKind == .completion
+            || suggestionKind == .correction
+            || suggestion.localizedCaseInsensitiveCompare(partial) == .orderedSame
+            || suggestion.lowercased().hasPrefix(partial.lowercased())
     }
 
     private func openAIRewriteMode() {
@@ -2444,6 +2507,21 @@ extension KeyboardViewController: KeyboardSurfaceViewDelegate {
         case .globe, .modeToggle, .symbolToggle:
             break
         }
+    }
+
+    func keyboardSurfaceView(_ view: KeyboardSurfaceView, didGlideCursorBy offset: Int) {
+        guard offset != 0 else { return }
+        // Repositioning the caret abandons the in-progress word: any queued
+        // autocorrection, live decode, and touch buffer are anchored to the old caret
+        // position and would otherwise be applied in the wrong place.
+        pendingAutocorrection = nil
+        recentlyUndoneAutocorrection = nil
+        pendingRewriteUndo = nil
+        liveWordDecoder.reset()
+        commitTouchWord(actualWord: nil)
+        pendingSuggestionRefresh?.cancel()
+        textDocumentProxy.adjustTextPosition(byCharacterOffset: offset)
+        scheduleSuggestionRefresh()
     }
 
     func keyboardSurfaceView(_ view: KeyboardSurfaceView, didAccept suggestion: AtlasSuggestion, touchStartedAt: CFTimeInterval, touchEndedAt: CFTimeInterval) {

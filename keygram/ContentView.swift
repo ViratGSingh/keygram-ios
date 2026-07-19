@@ -171,6 +171,9 @@ struct ContentView: View {
     }
 
     private func refreshNextWordEvaluation() {
+        // Re-read the shared file first: the metrics are produced by the keyboard
+        // extension, so without a reload the app serves a stale in-memory cache.
+        NextWordFeedbackStore.shared.reloadFromDisk()
         nextWordEvaluation = NextWordFeedbackStore.shared.evaluationSnapshot()
     }
 
@@ -671,6 +674,7 @@ private struct KeyboardSettingsView: View {
         }
         .tint(enabledTint)
         .navigationTitle("Settings")
+        .onAppear(perform: refreshEvaluation)
     }
 }
 
